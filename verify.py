@@ -5,6 +5,7 @@ Replication lag is reported but does not affect the exit code: any real
 inconsistency caused by lag already shows up as missing/orphaned/stale.
 """
 import sys
+from dataclasses import dataclass
 
 import psycopg2
 from qdrant_client import QdrantClient
@@ -37,22 +38,42 @@ def read_qdrant() -> dict[int, str | None]:
             return points
 
 
-def main() -> int:
+@dataclass
+class Result:
+    source_rows: int
+    index_points: int
+    missing: list[int]
+    orphaned: list[int]
+    stale: list[int]
+    lag: int | None  # bytes; None if the slot doesn't exist
+
+    @property
+    def consistent(self) -> bool:
+        return not (self.missing or self.orphaned or self.stale)
+
+
+def check() -> Result:
+    """Compare Postgres with Qdrant right now. Importable by experiments."""
     source, lag = read_postgres()
     index = read_qdrant()
+    return Result(
+        source_rows=len(source),
+        index_points=len(index),
+        missing=sorted(source.keys() - index.keys()),
+        orphaned=sorted(index.keys() - source.keys()),
+        stale=sorted(i for i in source.keys() & index.keys() if source[i] != index[i]),
+        lag=lag,
+    )
 
-    missing = sorted(source.keys() - index.keys())
-    orphaned = sorted(index.keys() - source.keys())
-    stale = sorted(i for i in source.keys() & index.keys() if source[i] != index[i])
 
-    print(f"source rows: {len(source)}   index points: {len(index)}")
-    for name, ids in (("missing", missing), ("orphaned", orphaned), ("stale", stale)):
+def main() -> int:
+    r = check()
+    print(f"source rows: {r.source_rows}   index points: {r.index_points}")
+    for name, ids in (("missing", r.missing), ("orphaned", r.orphaned), ("stale", r.stale)):
         print(f"{name:9}{len(ids):4}  {ids}")
-    print(f"lag      {'slot not found' if lag is None else f'{lag} bytes'}")
-
-    consistent = not (missing or orphaned or stale)
-    print("CONSISTENT" if consistent else "INCONSISTENT")
-    return 0 if consistent else 1
+    print(f"lag      {'slot not found' if r.lag is None else f'{r.lag} bytes'}")
+    print("CONSISTENT" if r.consistent else "INCONSISTENT")
+    return 0 if r.consistent else 1
 
 
 if __name__ == "__main__":
