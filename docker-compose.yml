@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    # wal_level=logical makes Postgres write enough info to the WAL for logical decoding.
+    # max_replication_slots / max_wal_senders must be >= 1 (defaults are 10, set explicitly for clarity).
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
