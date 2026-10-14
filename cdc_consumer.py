@@ -4,6 +4,7 @@ Run:  python cdc_consumer.py
 """
 import logging
 import re
+import signal
 
 import psycopg2
 import psycopg2.extras
@@ -115,16 +116,32 @@ def main() -> None:
     cur.start_replication(slot_name=SLOT, decode=True, options={"include-xids": "0", "skip-empty-xacts": "1"})
     log.info("streaming from slot %s ...", SLOT)
 
+    last_flushed = [0]  # LSN of the last message fully handled
+
     def consume(msg):
         handle(msg.payload.strip())
         # Acknowledge: tells Postgres it may discard WAL up to this LSN.
         # Done after handling, so a crash mid-change means redelivery (at-least-once).
+        # Note send_feedback() only *records* the LSN; psycopg2 transmits it when the
+        # status interval (~10 s) elapses, so a quick shutdown must force a final send.
         msg.cursor.send_feedback(flush_lsn=msg.data_start)
+        last_flushed[0] = msg.data_start
 
+    def request_stop(*_):
+        raise KeyboardInterrupt  # route SIGTERM through the same clean-shutdown path as Ctrl+C
+
+    signal.signal(signal.SIGTERM, request_stop)
     try:
         cur.consume_stream(consume)
     except KeyboardInterrupt:
-        log.info("stopped")
+        if last_flushed[0]:
+            # Without this, an ack still waiting for the status interval is lost on exit and
+            # the next start replays everything since the last transmitted ack.
+            cur.send_feedback(flush_lsn=last_flushed[0], force=True)
+        lsn = last_flushed[0]
+        log.info("stopped; final flush at LSN %X/%X", lsn >> 32, lsn & 0xFFFFFFFF)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
