@@ -11,9 +11,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
 
-DSN = "host=localhost port=5432 dbname=app user=postgres password=postgres"
-SLOT = "articles_slot"
-COLLECTION = "articles"
+from common import COLLECTION, DSN, QDRANT_URL, SLOT, iso_utc
+
 MODEL_NAME = "all-MiniLM-L6-v2"  # 384-dim
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -47,7 +46,7 @@ def parse_columns(s: str) -> dict:
 
 # --- sinks -----------------------------------------------------------------
 model = SentenceTransformer(MODEL_NAME)
-qdrant = QdrantClient(url="http://localhost:6333")
+qdrant = QdrantClient(url=QDRANT_URL)
 if not qdrant.collection_exists(COLLECTION):
     qdrant.create_collection(
         COLLECTION,
@@ -74,13 +73,14 @@ def handle(payload: str) -> None:
         log.info("DELETE id=%s -> deleted point", article_id)
         return
 
+    updated_at = iso_utc(cols.get("updated_at"))
     text = f"{cols.get('title') or ''}\n{cols.get('body') or ''}"
     vector = model.encode(text).tolist()
     qdrant.upsert(
         COLLECTION,
-        points=[PointStruct(id=article_id, vector=vector, payload={"updated_at": cols.get("updated_at")})],
+        points=[PointStruct(id=article_id, vector=vector, payload={"updated_at": updated_at})],
     )
-    log.info("%s id=%s title=%r updated_at=%s -> upserted point", op, article_id, cols.get("title"), cols.get("updated_at"))
+    log.info("%s id=%s title=%r updated_at=%s -> upserted point", op, article_id, cols.get("title"), updated_at)
 
 
 # --- replication -----------------------------------------------------------
