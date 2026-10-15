@@ -38,9 +38,18 @@ CHANGE_RE = re.compile(r"^table (\w+)\.(\w+): (INSERT|UPDATE|DELETE):(.*)$", re.
 COL_RE = re.compile(r"(\w+)\[([^\]]+)\]:('(?:[^']|'')*'|\S+)")
 
 
+# For an UPDATE that doesn't touch a large (TOASTed) column, Postgres doesn't log its value and
+# test_decoding prints this bare placeholder instead. It is not data.
+UNCHANGED_TOAST = "unchanged-toast-datum"
+
+
 def parse_columns(s: str) -> dict:
+    """Parse columns into {name: value}. Columns that arrived as the TOAST placeholder are left out
+    entirely, so `"body" in cols` means "we were sent the body" and the placeholder never becomes a value."""
     cols = {}
     for name, _type, raw in COL_RE.findall(s):
+        if raw == UNCHANGED_TOAST:
+            continue
         if raw.startswith("'"):
             cols[name] = raw[1:-1].replace("''", "'")
         elif raw == "null":
@@ -61,13 +70,12 @@ if not qdrant.collection_exists(COLLECTION):
     qdrant.create_payload_index(COLLECTION, "article_id", PayloadSchemaType.INTEGER)  # for delete-by-article
 
 
+def article_filter(article_id: int) -> Filter:
+    return Filter(must=[FieldCondition(key="article_id", match=MatchValue(value=article_id))])
+
+
 def delete_article_points(article_id: int) -> None:
-    qdrant.delete(
-        COLLECTION,
-        points_selector=FilterSelector(
-            filter=Filter(must=[FieldCondition(key="article_id", match=MatchValue(value=article_id))])
-        ),
-    )
+    qdrant.delete(COLLECTION, points_selector=FilterSelector(filter=article_filter(article_id)))
 
 
 def handle(payload: str, mode: str) -> None:
@@ -90,6 +98,14 @@ def handle(payload: str, mode: str) -> None:
         return
 
     updated_at = iso_utc(cols.get("updated_at"))
+    if "body" not in cols:  # body arrived as the TOAST placeholder
+        if op == "INSERT":  # an insert always carries every column; don't index a row we can't read
+            log.error("INSERT id=%s arrived with an unchanged-toast body; skipping (not indexed)", article_id)
+            return
+        # Body untouched: the chunks are still right, so don't re-chunk or re-embed. Refresh the payload only.
+        qdrant.set_payload(COLLECTION, payload={"updated_at": updated_at}, points=article_filter(article_id))
+        log.info("UPDATE id=%s -> body unchanged, payload refreshed (%s)", article_id, mode)
+        return
     chunks = chunk_body(cols.get("body"))
     if op == "UPDATE" and mode == "correct":
         delete_article_points(article_id)  # drops chunks beyond the new count (and any stale ones)
