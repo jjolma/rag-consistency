@@ -1,10 +1,14 @@
 """Settings and helpers shared by the consumer and the verifier."""
+import hashlib
+import uuid
 from datetime import datetime, timezone
 
 DSN = "host=localhost port=5432 dbname=app user=postgres password=postgres"
 QDRANT_URL = "http://localhost:6333"
 SLOT = "articles_slot"
-COLLECTION = "articles"
+COLLECTION = "article_chunks"  # one point per (article_id, chunk_index)
+MODEL_NAME = "all-MiniLM-L6-v2"  # 384-dim
+CHUNK_SIZE = 200  # characters
 
 
 def iso_utc(ts) -> str | None:
@@ -18,3 +22,22 @@ def iso_utc(ts) -> str | None:
     if isinstance(ts, str):
         ts = datetime.fromisoformat(ts)
     return ts.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def chunk_body(body: str | None) -> list[str]:
+    """Split a body into fixed-size pieces of CHUNK_SIZE characters (the last may be shorter).
+
+    Deliberately naive (no word boundaries): the consumer and the verifier both call this,
+    so they always agree on what the chunks of a given body are.
+    """
+    body = body or ""
+    return [body[i:i + CHUNK_SIZE] for i in range(0, len(body), CHUNK_SIZE)]
+
+
+def chunk_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def point_id(article_id: int, chunk_index: int) -> str:
+    """Deterministic Qdrant point id (Qdrant ids must be uint or UUID, so a tuple becomes a uuid5)."""
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{article_id}:{chunk_index}"))

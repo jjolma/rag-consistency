@@ -44,11 +44,11 @@ READY_TIMEOUT_S = 120
 STREAMING_MARKER = b"streaming from slot"
 
 
-def start_consumer() -> subprocess.Popen:
+def start_consumer(*extra_args: str) -> subprocess.Popen:
     CONSUMER_LOG.parent.mkdir(exist_ok=True)
     log = open(CONSUMER_LOG, "ab")  # consumer logs to stderr; keep it for debugging
     log_offset = log.tell()  # the log is shared across spawns; only look at what this one writes
-    proc = subprocess.Popen([sys.executable, str(ROOT / "cdc_consumer.py")], stdout=log, stderr=log)
+    proc = subprocess.Popen([sys.executable, str(ROOT / "cdc_consumer.py"), *extra_args], stdout=log, stderr=log)
     log.close()  # the child holds its own copy of the fd
     proc.spawned = time.monotonic()
     proc.log_offset = log_offset

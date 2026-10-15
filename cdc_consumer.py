@@ -1,7 +1,13 @@
 """CDC consumer: Postgres logical replication (test_decoding) -> Qdrant.
 
-Run:  python cdc_consumer.py
+Run:  python cdc_consumer.py [--mode naive|correct]
+
+Each article body is split into chunks; every chunk is one Qdrant point. On UPDATE:
+  correct (default): delete all points of the article, then insert the new chunks
+  naive:             just upsert the new chunks (leaves orphans if the text got shorter)
+DELETE removes all the article's points in both modes.
 """
+import argparse
 import logging
 import re
 import signal
@@ -9,12 +15,11 @@ import signal
 import psycopg2
 import psycopg2.extras
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (Distance, FieldCondition, Filter, FilterSelector, MatchValue,
+                                  PayloadSchemaType, PointStruct, VectorParams)
 from sentence_transformers import SentenceTransformer
 
-from common import COLLECTION, DSN, QDRANT_URL, SLOT, iso_utc
-
-MODEL_NAME = "all-MiniLM-L6-v2"  # 384-dim
+from common import COLLECTION, DSN, MODEL_NAME, QDRANT_URL, SLOT, chunk_body, chunk_hash, iso_utc, point_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 for noisy in ("httpx", "huggingface_hub", "sentence_transformers"):
@@ -53,9 +58,19 @@ if not qdrant.collection_exists(COLLECTION):
         COLLECTION,
         vectors_config=VectorParams(size=model.get_embedding_dimension(), distance=Distance.COSINE),
     )
+    qdrant.create_payload_index(COLLECTION, "article_id", PayloadSchemaType.INTEGER)  # for delete-by-article
 
 
-def handle(payload: str) -> None:
+def delete_article_points(article_id: int) -> None:
+    qdrant.delete(
+        COLLECTION,
+        points_selector=FilterSelector(
+            filter=Filter(must=[FieldCondition(key="article_id", match=MatchValue(value=article_id))])
+        ),
+    )
+
+
+def handle(payload: str, mode: str) -> None:
     if payload.startswith(("BEGIN", "COMMIT")):
         log.debug(payload)
         return
@@ -70,18 +85,29 @@ def handle(payload: str) -> None:
     article_id = int(cols["id"])
 
     if op == "DELETE":
-        qdrant.delete(COLLECTION, points_selector=[article_id])
-        log.info("DELETE id=%s -> deleted point", article_id)
+        delete_article_points(article_id)
+        log.info("DELETE id=%s -> deleted all points", article_id)
         return
 
     updated_at = iso_utc(cols.get("updated_at"))
-    text = f"{cols.get('title') or ''}\n{cols.get('body') or ''}"
-    vector = model.encode(text).tolist()
-    qdrant.upsert(
-        COLLECTION,
-        points=[PointStruct(id=article_id, vector=vector, payload={"updated_at": updated_at})],
-    )
-    log.info("%s id=%s title=%r updated_at=%s -> upserted point", op, article_id, cols.get("title"), updated_at)
+    chunks = chunk_body(cols.get("body"))
+    if op == "UPDATE" and mode == "correct":
+        delete_article_points(article_id)  # drops chunks beyond the new count (and any stale ones)
+    if chunks:
+        vectors = model.encode(chunks)
+        qdrant.upsert(
+            COLLECTION,
+            points=[
+                PointStruct(
+                    id=point_id(article_id, i),
+                    vector=vec.tolist(),
+                    payload={"article_id": article_id, "chunk_index": i, "updated_at": updated_at,
+                             "chunk_hash": chunk_hash(text)},
+                )
+                for i, (text, vec) in enumerate(zip(chunks, vectors))
+            ],
+        )
+    log.info("%s id=%s -> %d chunk(s) upserted (%s)", op, article_id, len(chunks), mode)
 
 
 # --- replication -----------------------------------------------------------
@@ -106,6 +132,9 @@ def ensure_slot() -> None:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mode", choices=["naive", "correct"], default="correct", help="how UPDATE treats existing chunks")
+    mode = ap.parse_args().mode
     ensure_slot()
     # A *replication* connection speaks the streaming replication protocol,
     # which is what lets us START_REPLICATION on a logical slot.
@@ -114,12 +143,12 @@ def main() -> None:
     # decode=True gives str payloads. Starting without start_lsn resumes from the
     # slot's confirmed position, i.e. everything we haven't acknowledged yet.
     cur.start_replication(slot_name=SLOT, decode=True, options={"include-xids": "0", "skip-empty-xacts": "1"})
-    log.info("streaming from slot %s ...", SLOT)
+    log.info("streaming from slot %s (mode=%s) ...", SLOT, mode)
 
     last_flushed = [0]  # LSN of the last message fully handled
 
     def consume(msg):
-        handle(msg.payload.strip())
+        handle(msg.payload.strip(), mode)
         # Acknowledge: tells Postgres it may discard WAL up to this LSN.
         # Done after handling, so a crash mid-change means redelivery (at-least-once).
         # Note send_feedback() only *records* the LSN; psycopg2 transmits it when the
