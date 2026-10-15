@@ -1,6 +1,10 @@
 """Backfill-under-load experiment: does snapshot-then-stream lose or double-apply anything?
 
-  python experiment_backfill.py [--min-seconds S]
+  python experiment_backfill.py [--variant snapshot|slot-first|select-first] [--min-seconds S]
+
+`snapshot` is the real backfill. The other two are negative controls that skip the exported snapshot:
+  slot-first   create the slot, then a plain SELECT, then stream (the slot predates the read)
+  select-first plain SELECT, then create the slot, then stream (changes in between are never seen)
 
   1. report the verifier's view of the starting state (rows that were never indexed)
   2. start a writer thread that keeps inserting / updating / deleting rows the whole time
@@ -27,6 +31,9 @@ import verify
 from common import COLLECTION, DSN, QDRANT_URL, iso_utc
 from experiment_outage import CONSUMER_LOG, POLL_S, require_no_other_consumer, start_consumer, stop_consumer
 from qdrant_client import QdrantClient
+
+
+IDLE_S = 5
 
 
 class Writer(threading.Thread):
@@ -107,11 +114,13 @@ def payload_updated_at_mismatches() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--variant", choices=["snapshot", "slot-first", "select-first"], default="snapshot")
     ap.add_argument("--min-seconds", type=float, default=3, help="keep writing at least this long after streaming starts")
     args = ap.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     require_no_other_consumer()
 
+    print(f"variant: {args.variant}")
     before = verify.check()
     print(f"before: {before.source_rows} articles, {before.index_points} indexed chunks, "
           f"{len(before.missing)} missing, {len(before.orphaned)} orphaned, {len(before.stale)} stale")
@@ -121,12 +130,12 @@ def main() -> int:
     time.sleep(1)  # let the writer get going so the backfill starts under load
     consumer = None
     try:
-        consumer = start_consumer("--backfill")
+        consumer = start_consumer("--backfill" if args.variant == "snapshot" else f"--naive-backfill={args.variant}")
         marks = {}  # event -> writer.ops when the consumer's log first showed it
         t0 = time.monotonic()
         while "streaming" not in marks:
             text = log_since(consumer.log_offset)
-            for name, marker in (("snapshot", "consistent_point"), ("copied", "backfill: indexed"), ("streaming", "streaming from slot")):
+            for name, marker in (("slot created", "consistent_point"), ("copy finished", "backfill: indexed"), ("streaming", "streaming from slot")):
                 if name not in marks and marker in text:
                     marks[name] = writer.ops
             if consumer.poll() is not None or writer.error or time.monotonic() - t0 > 300:
@@ -138,10 +147,18 @@ def main() -> int:
         if writer.error:
             raise writer.error
 
-        start = time.monotonic()
+        # Wait until consistent, or (for the negative controls, which may never get there) until the
+        # consumer has gone quiet: its log is one line per applied change, so a log that stops growing
+        # for IDLE_S means it has caught up.
+        start, idle_since, last_size = time.monotonic(), time.monotonic(), -1
         while not (r := verify.check()).consistent:
-            if consumer.poll() is not None or time.monotonic() - start > 120:
-                raise RuntimeError(f"not consistent after the writer stopped: {r}")
+            size = CONSUMER_LOG.stat().st_size
+            if size != last_size:
+                last_size, idle_since = size, time.monotonic()
+            if consumer.poll() is not None or time.monotonic() - start > 180:
+                raise RuntimeError(f"consumer died or timed out before settling; see {CONSUMER_LOG}")
+            if time.monotonic() - idle_since > IDLE_S:
+                break
             time.sleep(POLL_S)
         bad_ts = payload_updated_at_mismatches()
     finally:
@@ -149,16 +166,21 @@ def main() -> int:
         stop_consumer(consumer)
 
     print(f"\nwriter: {writer.ops} changes total {writer.by_kind}")
-    print(f"  before snapshot   : {marks['snapshot']}   (approx.; log polled every 50 ms)")
-    print(f"  during the copy   : {marks['copied'] - marks['snapshot']}   (committed while the backfill was reading the snapshot)")
-    print(f"  copy end->stream  : {marks['streaming'] - marks['copied']}")
-    print(f"  after streaming   : {writer.ops - marks['streaming']}")
+    print("  changes committed when each event first showed in the consumer log (approx.; polled every 50 ms):")
+    for name, ops in sorted(marks.items(), key=lambda kv: kv[1]):
+        print(f"    {name:14}: {ops}")
     print("\nconsumer log:")
     print("".join(f"  {ln}\n" for ln in log_since(consumer.log_offset).splitlines()
                   if "backfill" in ln or "streaming" in ln or "ERROR" in ln or "WARNING" in ln))
     print(f"payload updated_at mismatches: {bad_ts}")
-    print("\nverifier:")
-    verify.main()
+    # Same layout as verify.main(), but long lists are cut so a failing run stays readable.
+    print(f"\nverifier ({args.variant}):  [full lists: python verify.py]")
+    print(f"source rows: {r.source_rows}   index points: {r.index_points}")
+    for name in ("missing", "orphaned", "stale"):
+        ks = getattr(r, name)
+        print(f"{name:9}{len(ks):4}  {ks[:5]}{' ...' if len(ks) > 5 else ''}")
+    print(f"lag      {'slot not found' if r.lag is None else f'{r.lag} bytes'}")
+    print("CONSISTENT" if r.consistent else "INCONSISTENT")
     return 0 if r.consistent and bad_ts == 0 else 1
 
 

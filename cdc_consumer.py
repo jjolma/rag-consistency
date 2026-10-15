@@ -173,7 +173,7 @@ def drop_slot_if_exists() -> None:
     conn.close()
 
 
-def backfill() -> psycopg2.extensions.connection:
+def backfill(variant: str = "snapshot") -> psycopg2.extensions.connection:
     """Index every existing row, then hand over to streaming with no gap and no overlap.
 
     The handoff problem: rows already in the table are not in the WAL we will stream, and a
@@ -197,6 +197,9 @@ def backfill() -> psycopg2.extensions.connection:
     connection. The slot retains WAL from consistent_point on, so a long copy loses nothing.
     The rebuild starts from an empty collection so rows deleted earlier can't linger.
 
+    `variant` exists only so experiment_backfill.py can run negative controls. "snapshot" is the
+    real thing; "slot-first" and "select-first" skip the exported snapshot (see create/copy below).
+
     Returns the replication connection, which still owns the slot, ready to stream.
     """
     drop_slot_if_exists()
@@ -204,16 +207,22 @@ def backfill() -> psycopg2.extensions.connection:
     t0 = time.monotonic()
     repl = psycopg2.connect(DSN, connection_factory=psycopg2.extras.LogicalReplicationConnection)
     rcur = repl.cursor()
-    # psycopg2's create_replication_slot() has no EXPORT_SNAPSHOT option, but the replication
-    # cursor will run the raw command and return its result row.
-    rcur.execute(f"CREATE_REPLICATION_SLOT {SLOT} LOGICAL test_decoding EXPORT_SNAPSHOT")
-    _slot, consistent_point, snapshot, _plugin = rcur.fetchone()
-    log.info("backfill: slot %s created, consistent_point=%s, snapshot=%s", SLOT, consistent_point, snapshot)
-    try:
+
+    def create_slot(export_snapshot: bool) -> str | None:
+        # psycopg2's create_replication_slot() has no snapshot option, but the replication
+        # cursor will run the raw command and return its result row.
+        option = "EXPORT_SNAPSHOT" if export_snapshot else "NOEXPORT_SNAPSHOT"
+        rcur.execute(f"CREATE_REPLICATION_SLOT {SLOT} LOGICAL test_decoding {option}")
+        _slot, consistent_point, snapshot, _plugin = rcur.fetchone()
+        log.info("backfill: slot %s created, consistent_point=%s, snapshot=%s", SLOT, consistent_point, snapshot)
+        return snapshot
+
+    def copy_table(snapshot: str | None) -> tuple[int, int]:
         reader = psycopg2.connect(DSN)
-        reader.set_session(isolation_level="REPEATABLE READ", readonly=True)
-        with reader.cursor() as cur:
-            cur.execute("SET TRANSACTION SNAPSHOT %s", (snapshot,))  # must be the transaction's first statement
+        if snapshot:
+            reader.set_session(isolation_level="REPEATABLE READ", readonly=True)
+            with reader.cursor() as cur:
+                cur.execute("SET TRANSACTION SNAPSHOT %s", (snapshot,))  # must be the transaction's first statement
         n_articles = n_chunks = 0
         with reader.cursor(name="backfill_articles") as cur:  # server-side cursor: don't load the table into memory
             cur.itersize = 200
@@ -225,6 +234,21 @@ def backfill() -> psycopg2.extensions.connection:
                 n_chunks += len(items)
         reader.rollback()
         reader.close()
+        return n_articles, n_chunks
+
+    try:
+        if variant == "snapshot":
+            n_articles, n_chunks = copy_table(create_slot(export_snapshot=True))
+        elif variant == "slot-first":  # NEGATIVE CONTROL: slot, then a plain SELECT with no shared snapshot
+            log.warning("backfill: NAIVE variant 'slot-first' (negative control, not for real use)")
+            create_slot(export_snapshot=False)
+            n_articles, n_chunks = copy_table(None)
+        elif variant == "select-first":  # NEGATIVE CONTROL: plain SELECT, then create the slot
+            log.warning("backfill: NAIVE variant 'select-first' (negative control, not for real use)")
+            n_articles, n_chunks = copy_table(None)
+            create_slot(export_snapshot=False)
+        else:
+            raise ValueError(variant)
     except BaseException:
         # Leaving the slot behind would let a plain restart stream from consistent_point on top
         # of a half-built index and look healthy. Drop it so the failure is loud.
@@ -238,11 +262,15 @@ def backfill() -> psycopg2.extensions.connection:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["naive", "correct"], default="correct", help="how UPDATE treats existing chunks")
-    ap.add_argument("--backfill", action="store_true", help="index all existing rows first (replaces the slot and the index)")
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--backfill", action="store_true", help="index all existing rows first (replaces the slot and the index)")
+    group.add_argument("--naive-backfill", nargs="?", const="slot-first", choices=["slot-first", "select-first"],
+                       help="NEGATIVE CONTROL: backfill without an exported snapshot (slot-first: create the slot, then "
+                            "plain SELECT; select-first: plain SELECT, then create the slot). Default: slot-first")
     args = ap.parse_args()
     mode = args.mode
-    if args.backfill:
-        conn = backfill()
+    if args.backfill or args.naive_backfill:
+        conn = backfill("snapshot" if args.backfill else args.naive_backfill)
     else:
         ensure_slot()
         # A *replication* connection speaks the streaming replication protocol,
