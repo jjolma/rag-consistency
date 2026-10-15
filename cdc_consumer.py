@@ -1,6 +1,9 @@
 """CDC consumer: Postgres logical replication (test_decoding) -> Qdrant.
 
-Run:  python cdc_consumer.py [--mode naive|correct]
+Run:  python cdc_consumer.py [--mode naive|correct] [--backfill]
+
+--backfill first indexes every row that already exists (snapshot-then-stream, see backfill()),
+then streams. Use it for the first run, or to rebuild the index from scratch.
 
 Each article body is split into chunks; every chunk is one Qdrant point. On UPDATE:
   correct (default): delete all points of the article, then insert the new chunks
@@ -11,6 +14,7 @@ import argparse
 import logging
 import re
 import signal
+import time
 
 import psycopg2
 import psycopg2.extras
@@ -62,16 +66,43 @@ def parse_columns(s: str) -> dict:
 # --- sinks -----------------------------------------------------------------
 model = SentenceTransformer(MODEL_NAME)
 qdrant = QdrantClient(url=QDRANT_URL)
-if not qdrant.collection_exists(COLLECTION):
-    qdrant.create_collection(
-        COLLECTION,
-        vectors_config=VectorParams(size=model.get_embedding_dimension(), distance=Distance.COSINE),
-    )
-    qdrant.create_payload_index(COLLECTION, "article_id", PayloadSchemaType.INTEGER)  # for delete-by-article
+
+
+def ensure_collection(recreate: bool = False) -> None:
+    if recreate and qdrant.collection_exists(COLLECTION):
+        qdrant.delete_collection(COLLECTION)
+    if not qdrant.collection_exists(COLLECTION):
+        qdrant.create_collection(
+            COLLECTION,
+            vectors_config=VectorParams(size=model.get_embedding_dimension(), distance=Distance.COSINE),
+        )
+        qdrant.create_payload_index(COLLECTION, "article_id", PayloadSchemaType.INTEGER)  # for delete-by-article
+
+
+ensure_collection()
 
 
 def article_filter(article_id: int) -> Filter:
     return Filter(must=[FieldCondition(key="article_id", match=MatchValue(value=article_id))])
+
+
+def upsert_chunks(items: list[tuple[int, int, str, str | None]], batch: int = 256) -> None:
+    """Embed and upsert chunks. items are (article_id, chunk_index, text, updated_at)."""
+    for start in range(0, len(items), batch):
+        part = items[start:start + batch]
+        vectors = model.encode([text for _, _, text, _ in part])
+        qdrant.upsert(
+            COLLECTION,
+            points=[
+                PointStruct(
+                    id=point_id(article_id, i),
+                    vector=vec.tolist(),
+                    payload={"article_id": article_id, "chunk_index": i, "updated_at": updated_at,
+                             "chunk_hash": chunk_hash(text)},
+                )
+                for (article_id, i, text, updated_at), vec in zip(part, vectors)
+            ],
+        )
 
 
 def delete_article_points(article_id: int) -> None:
@@ -109,20 +140,7 @@ def handle(payload: str, mode: str) -> None:
     chunks = chunk_body(cols.get("body"))
     if op == "UPDATE" and mode == "correct":
         delete_article_points(article_id)  # drops chunks beyond the new count (and any stale ones)
-    if chunks:
-        vectors = model.encode(chunks)
-        qdrant.upsert(
-            COLLECTION,
-            points=[
-                PointStruct(
-                    id=point_id(article_id, i),
-                    vector=vec.tolist(),
-                    payload={"article_id": article_id, "chunk_index": i, "updated_at": updated_at,
-                             "chunk_hash": chunk_hash(text)},
-                )
-                for i, (text, vec) in enumerate(zip(chunks, vectors))
-            ],
-        )
+    upsert_chunks([(article_id, i, text, updated_at) for i, text in enumerate(chunks)])
     log.info("%s id=%s -> %d chunk(s) upserted (%s)", op, article_id, len(chunks), mode)
 
 
@@ -147,14 +165,89 @@ def ensure_slot() -> None:
     conn.close()
 
 
+def drop_slot_if_exists() -> None:
+    with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = %s", (SLOT,))
+        if cur.rowcount:
+            log.warning("dropped existing slot %s (its position is meaningless for a rebuild)", SLOT)
+    conn.close()
+
+
+def backfill() -> psycopg2.extensions.connection:
+    """Index every existing row, then hand over to streaming with no gap and no overlap.
+
+    The handoff problem: rows already in the table are not in the WAL we will stream, and a
+    plain SELECT races with concurrent writes (a change committed during the SELECT could be
+    both read here and streamed later, or fall between the two). Postgres solves it by making
+    one point in the WAL the dividing line, and giving us both halves of it:
+
+      1. CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT, on a replication connection, creates the
+         slot and picks a consistent_point LSN. The slot will deliver every transaction that
+         commits after that LSN. It also exports a snapshot: a view of the table containing
+         exactly the transactions committed before that LSN. Same boundary, both sides.
+      2. A second, ordinary connection opens a REPEATABLE READ transaction and runs
+         SET TRANSACTION SNAPSHOT '<name>' as its first statement, so it reads the table as of
+         that moment however long the read takes and however much is written meanwhile.
+      3. When the copy is done we START_REPLICATION on the slot, which resumes at
+         consistent_point. Everything the snapshot already contains is not re-sent; everything
+         after it is.
+
+    Constraints: the exported snapshot is only valid while the replication connection is idle
+    (it dies at its next command), so we import it before doing anything else on that
+    connection. The slot retains WAL from consistent_point on, so a long copy loses nothing.
+    The rebuild starts from an empty collection so rows deleted earlier can't linger.
+
+    Returns the replication connection, which still owns the slot, ready to stream.
+    """
+    drop_slot_if_exists()
+    ensure_collection(recreate=True)
+    t0 = time.monotonic()
+    repl = psycopg2.connect(DSN, connection_factory=psycopg2.extras.LogicalReplicationConnection)
+    rcur = repl.cursor()
+    # psycopg2's create_replication_slot() has no EXPORT_SNAPSHOT option, but the replication
+    # cursor will run the raw command and return its result row.
+    rcur.execute(f"CREATE_REPLICATION_SLOT {SLOT} LOGICAL test_decoding EXPORT_SNAPSHOT")
+    _slot, consistent_point, snapshot, _plugin = rcur.fetchone()
+    log.info("backfill: slot %s created, consistent_point=%s, snapshot=%s", SLOT, consistent_point, snapshot)
+    try:
+        reader = psycopg2.connect(DSN)
+        reader.set_session(isolation_level="REPEATABLE READ", readonly=True)
+        with reader.cursor() as cur:
+            cur.execute("SET TRANSACTION SNAPSHOT %s", (snapshot,))  # must be the transaction's first statement
+        n_articles = n_chunks = 0
+        with reader.cursor(name="backfill_articles") as cur:  # server-side cursor: don't load the table into memory
+            cur.itersize = 200
+            cur.execute("SELECT id, body, updated_at FROM articles ORDER BY id")
+            while rows := cur.fetchmany(200):
+                items = [(id_, i, text, iso_utc(ts)) for id_, body, ts in rows for i, text in enumerate(chunk_body(body))]
+                upsert_chunks(items)
+                n_articles += len(rows)
+                n_chunks += len(items)
+        reader.rollback()
+        reader.close()
+    except BaseException:
+        # Leaving the slot behind would let a plain restart stream from consistent_point on top
+        # of a half-built index and look healthy. Drop it so the failure is loud.
+        repl.close()
+        drop_slot_if_exists()
+        raise
+    log.info("backfill: indexed %d articles / %d chunks in %.1fs", n_articles, n_chunks, time.monotonic() - t0)
+    return repl
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["naive", "correct"], default="correct", help="how UPDATE treats existing chunks")
-    mode = ap.parse_args().mode
-    ensure_slot()
-    # A *replication* connection speaks the streaming replication protocol,
-    # which is what lets us START_REPLICATION on a logical slot.
-    conn = psycopg2.connect(DSN, connection_factory=psycopg2.extras.LogicalReplicationConnection)
+    ap.add_argument("--backfill", action="store_true", help="index all existing rows first (replaces the slot and the index)")
+    args = ap.parse_args()
+    mode = args.mode
+    if args.backfill:
+        conn = backfill()
+    else:
+        ensure_slot()
+        # A *replication* connection speaks the streaming replication protocol,
+        # which is what lets us START_REPLICATION on a logical slot.
+        conn = psycopg2.connect(DSN, connection_factory=psycopg2.extras.LogicalReplicationConnection)
     cur = conn.cursor()
     # decode=True gives str payloads. Starting without start_lsn resumes from the
     # slot's confirmed position, i.e. everything we haven't acknowledged yet.
