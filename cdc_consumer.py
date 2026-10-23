@@ -12,6 +12,7 @@ DELETE removes all the article's points in both modes.
 """
 import argparse
 import logging
+import os
 import re
 import signal
 import time
@@ -29,6 +30,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 for noisy in ("httpx", "huggingface_hub", "sentence_transformers"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("cdc")
+
+UPSERT_BATCH = int(os.environ.get("UPSERT_BATCH", "256"))  # points per Qdrant upsert request; lowered by fault experiments
+
+# --- fault injection (experiment_faults.py) --------------------------------
+# hook(name) marks a stage boundary. It does nothing unless one of these is set:
+#   STAGE_FILE  file that always holds the last boundary crossed. A kill -9 can't lose a write
+#               that already reached the OS, so after a crash it says which stage the process died in.
+#   FAULT, FAULT_AT  SIGKILL ourselves the FAULT_AT-th time boundary FAULT is reached.
+STAGE_FILE = os.environ.get("STAGE_FILE")
+FAULT = os.environ.get("FAULT")
+FAULT_AT = int(os.environ.get("FAULT_AT", "1"))
+_stage_fd = os.open(STAGE_FILE, os.O_WRONLY | os.O_CREAT) if STAGE_FILE else None
+_hits: dict[str, int] = {}
+
+
+def hook(name: str) -> None:
+    if _stage_fd is not None:
+        os.pwrite(_stage_fd, name.encode().ljust(32), 0)
+    if name == FAULT:
+        _hits[name] = _hits.get(name, 0) + 1
+        if _hits[name] == FAULT_AT:
+            os.kill(os.getpid(), signal.SIGKILL)  # same as an external kill -9: no handlers, no flush
 
 
 # --- test_decoding parsing -------------------------------------------------
@@ -86,11 +109,12 @@ def article_filter(article_id: int) -> Filter:
     return Filter(must=[FieldCondition(key="article_id", match=MatchValue(value=article_id))])
 
 
-def upsert_chunks(items: list[tuple[int, int, str, str | None]], batch: int = 256) -> None:
+def upsert_chunks(items: list[tuple[int, int, str, str | None]], batch: int = UPSERT_BATCH) -> None:
     """Embed and upsert chunks. items are (article_id, chunk_index, text, updated_at)."""
     for start in range(0, len(items), batch):
         part = items[start:start + batch]
         vectors = model.encode([text for _, _, text, _ in part])
+        hook("after_embed")
         qdrant.upsert(
             COLLECTION,
             points=[
@@ -103,10 +127,15 @@ def upsert_chunks(items: list[tuple[int, int, str, str | None]], batch: int = 25
                 for (article_id, i, text, updated_at), vec in zip(part, vectors)
             ],
         )
+        if start + batch < len(items):
+            hook("mid_upsert")
+    hook("after_upsert")
 
 
 def delete_article_points(article_id: int) -> None:
+    hook("before_delete")
     qdrant.delete(COLLECTION, points_selector=FilterSelector(filter=article_filter(article_id)))
+    hook("after_delete")
 
 
 def handle(payload: str, mode: str) -> None:
@@ -134,7 +163,9 @@ def handle(payload: str, mode: str) -> None:
             log.error("INSERT id=%s arrived with an unchanged-toast body; skipping (not indexed)", article_id)
             return
         # Body untouched: the chunks are still right, so don't re-chunk or re-embed. Refresh the payload only.
+        hook("before_set_payload")
         qdrant.set_payload(COLLECTION, payload={"updated_at": updated_at}, points=article_filter(article_id))
+        hook("after_set_payload")
         log.info("UPDATE id=%s -> body unchanged, payload refreshed (%s)", article_id, mode)
         return
     chunks = chunk_body(cols.get("body"))
@@ -232,6 +263,7 @@ def backfill(variant: str = "snapshot") -> psycopg2.extensions.connection:
                 upsert_chunks(items)
                 n_articles += len(rows)
                 n_chunks += len(items)
+                hook("backfill_mid_copy")
         reader.rollback()
         reader.close()
         return n_articles, n_chunks
@@ -256,6 +288,7 @@ def backfill(variant: str = "snapshot") -> psycopg2.extensions.connection:
         drop_slot_if_exists()
         raise
     log.info("backfill: indexed %d articles / %d chunks in %.1fs", n_articles, n_chunks, time.monotonic() - t0)
+    hook("backfill_pre_stream")
     return repl
 
 
@@ -267,6 +300,8 @@ def main() -> None:
     group.add_argument("--naive-backfill", nargs="?", const="slot-first", choices=["slot-first", "select-first"],
                        help="NEGATIVE CONTROL: backfill without an exported snapshot (slot-first: create the slot, then "
                             "plain SELECT; select-first: plain SELECT, then create the slot). Default: slot-first")
+    ap.add_argument("--ack-first", action="store_true",
+                    help="NEGATIVE CONTROL: acknowledge each transaction before applying it (loses changes on a crash)")
     args = ap.parse_args()
     mode = args.mode
     if args.backfill or args.naive_backfill:
@@ -284,21 +319,44 @@ def main() -> None:
 
     last_flushed = [0]  # LSN of the last message fully handled
 
+    pending: list[str] = []  # --ack-first only: a transaction's changes, held until its COMMIT arrives
+
+    def consume_ack_first(msg):
+        # NEGATIVE CONTROL. Acking a change message's own LSN would not skip its transaction (Postgres
+        # replays any transaction whose commit is past the acked LSN), so to really ack before applying
+        # we must ack the COMMIT, which means holding the changes back until it arrives. Forced, so the
+        # ack reaches Postgres before we start the slow part.
+        payload = msg.payload.strip()
+        if payload.startswith("BEGIN"):
+            pending.clear()
+        elif payload.startswith("COMMIT"):
+            msg.cursor.send_feedback(flush_lsn=msg.data_start, force=True)
+            last_flushed[0] = msg.data_start
+            for p in pending:
+                hook("recv")
+                handle(p, mode)
+            pending.clear()
+        else:
+            pending.append(payload)
+
     def consume(msg):
+        hook("recv")
         handle(msg.payload.strip(), mode)
+        hook("before_ack")
         # Acknowledge: tells Postgres it may discard WAL up to this LSN.
         # Done after handling, so a crash mid-change means redelivery (at-least-once).
         # Note send_feedback() only *records* the LSN; psycopg2 transmits it when the
         # status interval (~10 s) elapses, so a quick shutdown must force a final send.
         msg.cursor.send_feedback(flush_lsn=msg.data_start)
         last_flushed[0] = msg.data_start
+        hook("acked")
 
     def request_stop(*_):
         raise KeyboardInterrupt  # route SIGTERM through the same clean-shutdown path as Ctrl+C
 
     signal.signal(signal.SIGTERM, request_stop)
     try:
-        cur.consume_stream(consume)
+        cur.consume_stream(consume_ack_first if args.ack_first else consume)
     except KeyboardInterrupt:
         if last_flushed[0]:
             # Without this, an ack still waiting for the status interval is lost on exit and

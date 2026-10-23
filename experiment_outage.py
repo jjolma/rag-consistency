@@ -18,6 +18,7 @@ Both boundaries are observed by polling every 100 ms, so each has ~0.1 s resolut
 """
 import argparse
 import csv
+import os
 import random
 import signal
 import subprocess
@@ -44,11 +45,12 @@ READY_TIMEOUT_S = 120
 STREAMING_MARKER = b"streaming from slot"
 
 
-def start_consumer(*extra_args: str) -> subprocess.Popen:
+def start_consumer(*extra_args: str, env: dict[str, str] | None = None) -> subprocess.Popen:
     CONSUMER_LOG.parent.mkdir(exist_ok=True)
     log = open(CONSUMER_LOG, "ab")  # consumer logs to stderr; keep it for debugging
     log_offset = log.tell()  # the log is shared across spawns; only look at what this one writes
-    proc = subprocess.Popen([sys.executable, str(ROOT / "cdc_consumer.py"), *extra_args], stdout=log, stderr=log)
+    proc = subprocess.Popen([sys.executable, str(ROOT / "cdc_consumer.py"), *extra_args], stdout=log, stderr=log,
+                            env={**os.environ, **(env or {})})
     log.close()  # the child holds its own copy of the fd
     proc.spawned = time.monotonic()
     proc.log_offset = log_offset
