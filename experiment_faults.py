@@ -1,7 +1,7 @@
 """Fault-injection (kill -9) experiments against the CDC consumer.
 
   python experiment_faults.py calibrate [--rows 800] [--changes 100]
-  python experiment_faults.py backfill --recovery plain|rebackfill [--trials 20] [--rows 800]
+  python experiment_faults.py backfill --recovery plain|rebackfill [--trials 20] [--rows 800] [--no-backfill-marker]
   python experiment_faults.py control --ack-first [--trials 20] [--window 3]
   python experiment_faults.py steady --kill random [--trials N | --minutes M] [--window 3]
 
@@ -15,7 +15,8 @@ Every trial ends the same way, so results are comparable:
   4. verify.check(); again 3 s later. clean = both consistent. Anything else is a PERSISTENT
      inconsistency: the restart did not repair it.
 Between the kill and the barrier the verifier is sampled, giving the TRANSIENT exposure
-(recovery_s = kill -> barrier, inconsistent_s = part of that the index was wrong).
+(recovery_s = kill -> barrier, inconsistent_s = part of that the index was wrong, absent_s = part of
+that the collection did not exist, e.g. while a --backfill had it deleted).
 
 Scenarios (the `scenario` column of results/faults.csv):
   backfill-plain       kill --backfill mid-copy at a random batch, restart with a plain consumer
@@ -28,6 +29,10 @@ Scenarios (the `scenario` column of results/faults.csv):
 Burst kills: a writer thread starts, then the victim is killed after a random 0.05..WINDOW seconds,
 while the consumer is still working through the backlog. `kill_stage` is the last stage boundary
 the consumer crossed (STAGE_FILE), so each random kill is attributed to a stage.
+
+final_lag_bytes is the slot's lag (WAL bytes not yet confirmed) at the final verification, blank if
+the slot is gone; it should be near zero after a healthy recovery. --no-backfill-marker runs every
+consumer with the old behavior (no completion marker), so the original failure stays reproducible.
 
 A trial that leaves the index dirty is repaired by a full --backfill before the next one (recorded
 as repaired=1). calibrate writes results/faults_calibration.json.
@@ -62,9 +67,10 @@ CAL_PATH = RESULTS / "faults_calibration.json"
 STAGE_PATH = RESULTS / "stage"
 FIELDS = ["timestamp", "scenario", "trial", "seed", "fault", "kill_stage", "kill_after_s", "written",
           "applied_before_kill", "applied_after_restart", "slot_left", "missing_at_kill",
-          "recovery_s", "inconsistent_s", "max_missing", "max_orphaned", "max_stale", "max_payload",
-          "final_missing", "final_orphaned", "final_stale", "final_payload", "clean", "repaired"]
+          "recovery_s", "inconsistent_s", "absent_s", "max_missing", "max_orphaned", "max_stale", "max_payload",
+          "final_missing", "final_orphaned", "final_stale", "final_payload", "final_lag_bytes", "clean", "repaired"]
 APPLIED_RE = re.compile(r"\b(INSERT|UPDATE|DELETE) id=")
+NO_BACKFILL_MARKER = False  # set by --no-backfill-marker: every consumer started gets the flag
 STARTUP_TIMEOUT_S = 120
 SETTLE_S = 3  # second verification this long after the barrier, to catch late changes
 BACKFILL_BATCH = 200  # articles per fetchmany() in cdc_consumer.backfill()
@@ -77,6 +83,8 @@ def start(*args: str, env: dict[str, str] | None = None):
     """Start a consumer that records its current stage in STAGE_PATH."""
     RESULTS.mkdir(exist_ok=True)
     STAGE_PATH.unlink(missing_ok=True)  # a running consumer keeps writing to the inode it opened, so only unlink on a fresh start
+    if NO_BACKFILL_MARKER:
+        args = (*args, "--no-backfill-marker")
     return start_consumer(*args, env={"STAGE_FILE": str(STAGE_PATH), **(env or {})})
 
 
@@ -224,19 +232,22 @@ def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_a
     time.sleep(SETTLE_S)
     final = verify.check()
     results = [r for _, r in samples]
-    inconsistent = 0.0
+    inconsistent = absent = 0.0
     for i, (t, r) in enumerate(samples):
         t_next = samples[i + 1][0] if i + 1 < len(samples) else t_barrier
         if not r.consistent:
             inconsistent += t_next - t
+        if r.index_absent:  # also inconsistent whenever the table has rows; this says why
+            absent += t_next - t
     row.update(
         applied_after_restart=count_applied(recovery.log_offset),
         recovery_s=round(t_barrier - t_kill, 2),
-        inconsistent_s=round(inconsistent, 2),
+        inconsistent_s=round(inconsistent, 2), absent_s=round(absent, 2),
         max_missing=max(len(r.missing) for r in results), max_orphaned=max(len(r.orphaned) for r in results),
         max_stale=max(len(r.stale) for r in results), max_payload=max(len(r.payload_stale) for r in results),
         final_missing=len(final.missing), final_orphaned=len(final.orphaned),
         final_stale=len(final.stale), final_payload=len(final.payload_stale),
+        final_lag_bytes="" if final.lag is None else final.lag,
         clean=int(first.consistent and final.consistent),
     )
 
@@ -301,6 +312,10 @@ def backfill_trial(h: Harness, scenario: str, trial: int, seed: int, recovery: s
 
 def append_row(row: dict) -> None:
     RESULTS.mkdir(exist_ok=True)
+    if CSV_PATH.exists() and CSV_PATH.read_text().split("\n", 1)[0] != ",".join(FIELDS):
+        old = CSV_PATH.with_name(f"faults_{datetime.now():%Y%m%d_%H%M%S}.csv")  # columns changed: don't append misaligned rows
+        CSV_PATH.rename(old)
+        print(f"{CSV_PATH.name} has an older column layout; moved it to {old.name}")
     new_file = not CSV_PATH.exists()
     with open(CSV_PATH, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -356,6 +371,7 @@ def run_trials(name: str, trial_fn, trials: int | None, minutes: float | None) -
         print(f"[{name} {i}{'/' + str(trials) if trials else ''}] {durations[-1]:.0f}s  stage={row['kill_stage']}  "
               f"recovery={row['recovery_s']}s inconsistent={row['inconsistent_s']}s  "
               f"final m/o/s/p={row['final_missing']}/{row['final_orphaned']}/{row['final_stale']}/{row['final_payload']}  "
+              f"lag={'slot gone' if row['final_lag_bytes'] == '' else str(row['final_lag_bytes']) + 'B'}  "
               f"{'clean' if row['clean'] else 'DIRTY'}{' (repaired)' if row['repaired'] else ''}", flush=True)
     summarize(name, rows)
 
@@ -464,6 +480,8 @@ def main() -> None:
 
     def common(p, trials: int | None = 20, with_trials: bool = True):
         p.add_argument("--rows", type=int, default=800, help="make sure the table has at least this many articles")
+        p.add_argument("--no-backfill-marker", action="store_true",
+                       help="OLD BEHAVIOR: run every consumer with --no-backfill-marker, so an interrupted backfill is streamed from")
         p.add_argument("--seed", type=int, default=int(time.time()) % 100000, help="trial i uses seed+i (recorded in the CSV)")
         if with_trials:
             p.add_argument("--trials", type=int, default=trials)
@@ -492,6 +510,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.cmd == "steady" and not (args.trials or args.minutes):
         ap.error("steady needs --trials or --minutes")
+    global NO_BACKFILL_MARKER
+    NO_BACKFILL_MARKER = args.no_backfill_marker
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     require_no_other_consumer()
     if args.cmd == "calibrate":

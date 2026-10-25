@@ -5,6 +5,10 @@ Run:  python cdc_consumer.py [--mode naive|correct] [--backfill]
 --backfill first indexes every row that already exists (snapshot-then-stream, see backfill()),
 then streams. Use it for the first run, or to rebuild the index from scratch.
 
+A "backfill completed" marker (see the marker section) records that the copy finished. On a plain
+start, no marker (with or without a slot) means no backfill is known to have completed, so the
+consumer runs a full backfill instead of streaming onto a possibly partial index. --no-backfill-marker restores the old behavior.
+
 Each article body is split into chunks; every chunk is one Qdrant point. On UPDATE:
   correct (default): delete all points of the article, then insert the new chunks
   naive:             just upsert the new chunks (leaves orphans if the text got shorter)
@@ -16,6 +20,7 @@ import os
 import re
 import signal
 import time
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -103,6 +108,31 @@ def ensure_collection(recreate: bool = False) -> None:
 
 
 ensure_collection()
+
+
+# --- backfill-completed marker ---------------------------------------------
+# Lives in Qdrant, next to the index it vouches for: if the index is wiped or recreated the marker
+# goes with it. It is a separate one-point collection (a point in COLLECTION would show up as an
+# orphan in the verifier). Absent = "the index is not known to be complete".
+STATE_COLLECTION = "cdc_state"
+MARKER_ID = 1
+
+
+def clear_backfill_marker() -> None:
+    if qdrant.collection_exists(STATE_COLLECTION):
+        qdrant.delete_collection(STATE_COLLECTION)
+
+
+def write_backfill_marker(consistent_articles: int) -> None:
+    if not qdrant.collection_exists(STATE_COLLECTION):
+        qdrant.create_collection(STATE_COLLECTION, vectors_config=VectorParams(size=1, distance=Distance.COSINE))
+    qdrant.upsert(STATE_COLLECTION, wait=True, points=[PointStruct(
+        id=MARKER_ID, vector=[1.0],
+        payload={"backfill_completed_at": iso_utc(datetime.now(timezone.utc)), "articles": consistent_articles})])
+
+
+def backfill_marker_present() -> bool:
+    return qdrant.collection_exists(STATE_COLLECTION) and bool(qdrant.retrieve(STATE_COLLECTION, ids=[MARKER_ID]))
 
 
 def article_filter(article_id: int) -> Filter:
@@ -196,6 +226,14 @@ def ensure_slot() -> None:
     conn.close()
 
 
+def slot_exists() -> bool:
+    with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_replication_slots WHERE slot_name = %s", (SLOT,))
+        found = cur.fetchone() is not None
+    conn.close()
+    return found
+
+
 def drop_slot_if_exists() -> None:
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = %s", (SLOT,))
@@ -204,7 +242,7 @@ def drop_slot_if_exists() -> None:
     conn.close()
 
 
-def backfill(variant: str = "snapshot") -> psycopg2.extensions.connection:
+def backfill(variant: str = "snapshot", marker: bool = True) -> psycopg2.extensions.connection:
     """Index every existing row, then hand over to streaming with no gap and no overlap.
 
     The handoff problem: rows already in the table are not in the WAL we will stream, and a
@@ -228,11 +266,19 @@ def backfill(variant: str = "snapshot") -> psycopg2.extensions.connection:
     connection. The slot retains WAL from consistent_point on, so a long copy loses nothing.
     The rebuild starts from an empty collection so rows deleted earlier can't linger.
 
+    Completion marker: cleared before anything destructive (slot drop, collection recreate), written
+    only after the last upsert is acknowledged and before streaming starts. A crash in between leaves
+    slot-without-marker, which a plain start recognizes as an interrupted backfill. A crash after the
+    marker is written leaves slot-and-marker, which is safe to stream from: the slot kept the WAL.
+    marker=False (--no-backfill-marker) never writes it, but still clears it so a stale one from an
+    earlier run can't vouch for a half-built index.
+
     `variant` exists only so experiment_backfill.py can run negative controls. "snapshot" is the
     real thing; "slot-first" and "select-first" skip the exported snapshot (see create/copy below).
 
     Returns the replication connection, which still owns the slot, ready to stream.
     """
+    clear_backfill_marker()
     drop_slot_if_exists()
     ensure_collection(recreate=True)
     t0 = time.monotonic()
@@ -288,6 +334,10 @@ def backfill(variant: str = "snapshot") -> psycopg2.extensions.connection:
         drop_slot_if_exists()
         raise
     log.info("backfill: indexed %d articles / %d chunks in %.1fs", n_articles, n_chunks, time.monotonic() - t0)
+    if marker:
+        hook("backfill_pre_marker")
+        write_backfill_marker(n_articles)
+        log.info("backfill: completion marker written")
     hook("backfill_pre_stream")
     return repl
 
@@ -300,12 +350,22 @@ def main() -> None:
     group.add_argument("--naive-backfill", nargs="?", const="slot-first", choices=["slot-first", "select-first"],
                        help="NEGATIVE CONTROL: backfill without an exported snapshot (slot-first: create the slot, then "
                             "plain SELECT; select-first: plain SELECT, then create the slot). Default: slot-first")
+    ap.add_argument("--no-backfill-marker", action="store_true",
+                    help="OLD BEHAVIOR: don't write or check the backfill-completed marker (an interrupted backfill's "
+                         "slot is then streamed from as if the index were complete)")
     ap.add_argument("--ack-first", action="store_true",
                     help="NEGATIVE CONTROL: acknowledge each transaction before applying it (loses changes on a crash)")
     args = ap.parse_args()
     mode = args.mode
-    if args.backfill or args.naive_backfill:
-        conn = backfill("snapshot" if args.backfill else args.naive_backfill)
+    use_marker = not args.no_backfill_marker
+    variant = "snapshot" if args.backfill else args.naive_backfill
+    if not variant and use_marker and not backfill_marker_present():
+        log.warning("backfill-completed marker is missing (slot %s %s): no complete backfill is on record, "
+                    "so the index may be partial. Running a full backfill instead of streaming.",
+                    SLOT, "exists" if slot_exists() else "does not exist")
+        variant = "snapshot"
+    if variant:
+        conn = backfill(variant, marker=use_marker)
     else:
         ensure_slot()
         # A *replication* connection speaks the streaming replication protocol,

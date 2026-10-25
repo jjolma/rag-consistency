@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import psycopg2
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from common import COLLECTION, DSN, QDRANT_URL, SLOT, chunk_body, chunk_hash, iso_utc
 
@@ -41,18 +42,26 @@ def read_postgres() -> tuple[dict[Key, Chunk], int, int | None]:
     return chunks, len(articles), (int(row[0]) if row else None)
 
 
-def read_qdrant() -> dict[Key, Chunk]:
+def read_qdrant() -> tuple[dict[Key, Chunk], bool]:
+    """Return (points, index_absent). A --backfill deletes and recreates the collection, so it can
+    vanish at any moment, even between pages of the scroll; a 404 anywhere means the index is absent
+    (nothing indexed), and any pages already read are discarded rather than reported as a partial index."""
     client = QdrantClient(url=QDRANT_URL)
-    if not client.collection_exists(COLLECTION):  # consumer hasn't created it yet: nothing is indexed
-        return {}
-    points, offset = {}, None
-    while True:
-        batch, offset = client.scroll(COLLECTION, limit=500, offset=offset, with_payload=True, with_vectors=False)
-        for p in batch:
-            pl = p.payload or {}
-            points[(pl.get("article_id"), pl.get("chunk_index"))] = (pl.get("chunk_hash"), pl.get("updated_at"))
-        if offset is None:
-            return points
+    try:
+        if not client.collection_exists(COLLECTION):  # consumer hasn't created it yet: nothing is indexed
+            return {}, True
+        points, offset = {}, None
+        while True:
+            batch, offset = client.scroll(COLLECTION, limit=500, offset=offset, with_payload=True, with_vectors=False)
+            for p in batch:
+                pl = p.payload or {}
+                points[(pl.get("article_id"), pl.get("chunk_index"))] = (pl.get("chunk_hash"), pl.get("updated_at"))
+            if offset is None:
+                return points, False
+    except UnexpectedResponse as e:
+        if e.status_code != 404:
+            raise
+        return {}, True
 
 
 @dataclass
@@ -64,6 +73,7 @@ class Result:
     stale: list[Key]
     payload_stale: list[Key]
     lag: int | None  # bytes; None if the slot doesn't exist
+    index_absent: bool = False  # the collection did not exist (or vanished mid-read)
 
     @property
     def consistent(self) -> bool:
@@ -73,7 +83,7 @@ class Result:
 def check() -> Result:
     """Compare Postgres with Qdrant right now. Importable by experiments."""
     source, n_articles, lag = read_postgres()
-    index = read_qdrant()
+    index, index_absent = read_qdrant()
     return Result(
         source_rows=n_articles,
         index_points=len(index),
@@ -83,6 +93,7 @@ def check() -> Result:
         payload_stale=sorted(k for k in source.keys() & index.keys()
                              if source[k][0] == index[k][0] and source[k][1] != index[k][1]),
         lag=lag,
+        index_absent=index_absent,
     )
 
 
