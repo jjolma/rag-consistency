@@ -5,9 +5,15 @@ Run:  python cdc_consumer.py [--mode naive|correct] [--backfill]
 --backfill first indexes every row that already exists (snapshot-then-stream, see backfill()),
 then streams. Use it for the first run, or to rebuild the index from scratch.
 
-A "backfill completed" marker (see the marker section) records that the copy finished. On a plain
-start, no marker (with or without a slot) means no backfill is known to have completed, so the
-consumer runs a full backfill instead of streaming onto a possibly partial index. --no-backfill-marker restores the old behavior.
+Readers query the alias COLLECTION ("article_chunks"). A backfill builds into a fresh physical
+collection and switches the alias to it only once the copy is done, so the old index keeps serving
+(stale) during the rebuild instead of being emptied. --no-alias-swap restores the old behavior: the
+backfill deletes and recreates the physical collection that readers query.
+
+A "backfill completed" marker (see the marker section) records that the copy finished, and which
+collection the slot feeds. On a plain start, no marker (with or without a slot) means no backfill is
+known to have completed, so the consumer runs a full backfill instead of streaming onto a possibly
+partial index. --no-backfill-marker restores the old behavior (legacy mode only).
 
 Each article body is split into chunks; every chunk is one Qdrant point. On UPDATE:
   correct (default): delete all points of the article, then insert the new chunks
@@ -20,16 +26,18 @@ import os
 import re
 import signal
 import time
+import uuid
 from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
 from qdrant_client import QdrantClient
-from qdrant_client.models import (Distance, FieldCondition, Filter, FilterSelector, MatchValue,
-                                  PayloadSchemaType, PointStruct, VectorParams)
+from qdrant_client.models import (CreateAlias, CreateAliasOperation, DeleteAlias, DeleteAliasOperation, Distance,
+                                  FieldCondition, Filter, FilterSelector, MatchValue, PayloadSchemaType, PointStruct,
+                                  VectorParams)
 from sentence_transformers import SentenceTransformer
 
-from common import COLLECTION, DSN, MODEL_NAME, QDRANT_URL, SLOT, chunk_body, chunk_hash, iso_utc, point_id
+from common import COLLECTION, DSN, MODEL_NAME, QDRANT_URL, SLOT, alias_target, chunk_body, chunk_hash, iso_utc, point_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 for noisy in ("httpx", "huggingface_hub", "sentence_transformers"):
@@ -96,24 +104,100 @@ model = SentenceTransformer(MODEL_NAME)
 qdrant = QdrantClient(url=QDRANT_URL)
 
 
-def ensure_collection(recreate: bool = False) -> None:
-    if recreate and qdrant.collection_exists(COLLECTION):
-        qdrant.delete_collection(COLLECTION)
+def create_index_collection(name: str) -> None:
+    qdrant.create_collection(
+        name,
+        vectors_config=VectorParams(size=model.get_embedding_dimension(), distance=Distance.COSINE),
+    )
+    qdrant.create_payload_index(name, "article_id", PayloadSchemaType.INTEGER)  # for delete-by-article
+
+
+def ensure_collection() -> None:
+    """Legacy mode: COLLECTION is a physical collection, created on first use."""
     if not qdrant.collection_exists(COLLECTION):
-        qdrant.create_collection(
-            COLLECTION,
-            vectors_config=VectorParams(size=model.get_embedding_dimension(), distance=Distance.COSINE),
-        )
-        qdrant.create_payload_index(COLLECTION, "article_id", PayloadSchemaType.INTEGER)  # for delete-by-article
+        create_index_collection(COLLECTION)
 
 
-ensure_collection()
+# --- the alias -------------------------------------------------------------
+# COLLECTION is what readers (and streaming writes) address. In alias mode it is an alias for a
+# physical collection named article_chunks_<stamp>_<id>; a rebuild fills a new one and then repoints
+# the alias. In legacy mode (--no-alias-swap) COLLECTION is itself the physical collection.
+# Qdrant won't let a physical collection and an alias share a name, and delete_collection(<alias>) is a
+# silent no-op, so every place that removes things goes through physical_names() / alias_target().
+def physical_names() -> list[str]:
+    """Physical collections that belong to the index: the legacy one called COLLECTION, and the builds."""
+    return [c.name for c in qdrant.get_collections().collections
+            if c.name == COLLECTION or c.name.startswith(f"{COLLECTION}_")]
+
+
+def new_collection_name() -> str:
+    return f"{COLLECTION}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:6]}"
+
+
+def serving_collection() -> str | None:
+    """The physical collection a reader of COLLECTION gets right now, or None if there is nothing to read."""
+    return alias_target(qdrant) or (COLLECTION if qdrant.collection_exists(COLLECTION) else None)
+
+
+def swap_alias(collection: str) -> None:
+    """Point COLLECTION at `collection`. Delete-and-create go in one request, which Qdrant applies
+    atomically: a reader sees the old target or the new one, never no alias. Idempotent."""
+    current = alias_target(qdrant)
+    if current == collection:
+        return
+    create = CreateAliasOperation(create_alias=CreateAlias(collection_name=collection, alias_name=COLLECTION))
+    if current is not None:
+        qdrant.update_collection_aliases([DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION)), create])
+        return
+    if qdrant.collection_exists(COLLECTION):
+        # One-time migration from legacy mode: the old physical collection holds the alias's name and
+        # cannot be renamed, so there is a gap of two requests with nothing to read. Only the first swap.
+        log.warning("alias swap: replacing legacy physical collection %s with an alias (one-time gap)", COLLECTION)
+        qdrant.delete_collection(COLLECTION)
+    qdrant.update_collection_aliases([create])
+
+
+def drop_collections_except(keep: str | None) -> None:
+    """Delete every physical index collection but `keep`: superseded indexes and half-built ones."""
+    for name in physical_names():
+        if name != keep:
+            qdrant.delete_collection(name)
+            log.info("deleted collection %s", name)
+
+
+def sweep_orphans() -> None:
+    """Startup catch-all: delete every article_chunks_* collection except the alias target and the one the
+    marker names. The path-specific cleanups (recover_alias_state, backfill's start and end) cover the
+    crashes we know about; this covers whatever they miss. It must run after the marker has been handled,
+    and keeps the marker's collection even if the alias doesn't point at it: that is the finished build
+    the slot feeds, waiting for a roll-forward swap, and deleting it would lose the only copy."""
+    marker = read_backfill_marker()
+    keep = {alias_target(qdrant), (marker or {}).get("collection")} - {None}
+    for name in physical_names():
+        if name.startswith(f"{COLLECTION}_") and name not in keep:
+            log.warning("orphan sweep: deleting %s (not the alias target %s, not named by the marker)",
+                        name, alias_target(qdrant))
+            qdrant.delete_collection(name)
+
+
+def drop_index() -> None:
+    """Legacy rebuild: remove the alias (if any) and every physical collection."""
+    if alias_target(qdrant):
+        qdrant.update_collection_aliases([DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION))])
+    drop_collections_except(None)
 
 
 # --- backfill-completed marker ---------------------------------------------
 # Lives in Qdrant, next to the index it vouches for: if the index is wiped or recreated the marker
 # goes with it. It is a separate one-point collection (a point in COLLECTION would show up as an
 # orphan in the verifier). Absent = "the index is not known to be complete".
+#
+# It says: "the slot feeds physical collection `collection`, and that collection was completely
+# copied as of the slot's start". The alias can't say that. The alias only says which index readers
+# see; after a crash mid-rebuild it still points at the OLD index while the slot belongs to the NEW,
+# half-built one, and streaming that slot onto the old index would silently skip everything between
+# the two positions. So the marker is the commit point of a rebuild, and the alias swap is the
+# publication step that rolls forward from it (see recover_alias_state).
 STATE_COLLECTION = "cdc_state"
 MARKER_ID = 1
 
@@ -123,30 +207,64 @@ def clear_backfill_marker() -> None:
         qdrant.delete_collection(STATE_COLLECTION)
 
 
-def write_backfill_marker(consistent_articles: int) -> None:
+def write_backfill_marker(consistent_articles: int, collection: str) -> None:
     if not qdrant.collection_exists(STATE_COLLECTION):
         qdrant.create_collection(STATE_COLLECTION, vectors_config=VectorParams(size=1, distance=Distance.COSINE))
     qdrant.upsert(STATE_COLLECTION, wait=True, points=[PointStruct(
         id=MARKER_ID, vector=[1.0],
-        payload={"backfill_completed_at": iso_utc(datetime.now(timezone.utc)), "articles": consistent_articles})])
+        payload={"backfill_completed_at": iso_utc(datetime.now(timezone.utc)), "articles": consistent_articles,
+                 "collection": collection})])
+
+
+def read_backfill_marker() -> dict | None:
+    if not qdrant.collection_exists(STATE_COLLECTION):
+        return None
+    found = qdrant.retrieve(STATE_COLLECTION, ids=[MARKER_ID])
+    return found[0].payload if found else None
 
 
 def backfill_marker_present() -> bool:
-    return qdrant.collection_exists(STATE_COLLECTION) and bool(qdrant.retrieve(STATE_COLLECTION, ids=[MARKER_ID]))
+    return read_backfill_marker() is not None
+
+
+def recover_alias_state() -> str | None:
+    """Alias-mode plain start. Returns None if it is safe to stream, else why a full backfill is needed.
+
+    Crash points of a rebuild, and what this does about each (marker M, alias A, new build N, old build O):
+      before M is written (mid-copy, or copy done)   M absent, A -> O: full backfill. O kept serving the
+                                                     whole time; the half-built N is deleted by the next backfill.
+      after M, before the swap                       M -> N, A -> O: N is complete and the slot feeds it, so
+                                                     finish the swap and stream. No rebuild needed.
+      after the swap, before O is deleted            M -> N, A -> N: stream; O is garbage, deleted here.
+    A marker without a `collection` field is a legacy one: it vouches for the physical COLLECTION.
+    """
+    marker = read_backfill_marker()
+    if marker is None:
+        return "backfill-completed marker is missing"
+    built = marker.get("collection", COLLECTION)
+    if not qdrant.collection_exists(built):
+        return f"marker names collection {built}, which no longer exists"
+    if built != COLLECTION and serving_collection() != built:
+        log.warning("recovery: interrupted between marker and alias swap; finishing the swap to %s", built)
+        swap_alias(built)
+    drop_collections_except(built)
+    return None
 
 
 def article_filter(article_id: int) -> Filter:
     return Filter(must=[FieldCondition(key="article_id", match=MatchValue(value=article_id))])
 
 
-def upsert_chunks(items: list[tuple[int, int, str, str | None]], batch: int = UPSERT_BATCH) -> None:
-    """Embed and upsert chunks. items are (article_id, chunk_index, text, updated_at)."""
+def upsert_chunks(items: list[tuple[int, int, str, str | None]], batch: int = UPSERT_BATCH,
+                  collection: str = COLLECTION) -> None:
+    """Embed and upsert chunks. items are (article_id, chunk_index, text, updated_at). A rebuild passes the
+    physical collection it is filling; everything else writes through COLLECTION."""
     for start in range(0, len(items), batch):
         part = items[start:start + batch]
         vectors = model.encode([text for _, _, text, _ in part])
         hook("after_embed")
         qdrant.upsert(
-            COLLECTION,
+            collection,
             points=[
                 PointStruct(
                     id=point_id(article_id, i),
@@ -242,7 +360,7 @@ def drop_slot_if_exists() -> None:
     conn.close()
 
 
-def backfill(variant: str = "snapshot", marker: bool = True) -> psycopg2.extensions.connection:
+def backfill(variant: str = "snapshot", marker: bool = True, alias_swap: bool = True) -> psycopg2.extensions.connection:
     """Index every existing row, then hand over to streaming with no gap and no overlap.
 
     The handoff problem: rows already in the table are not in the WAL we will stream, and a
@@ -266,21 +384,39 @@ def backfill(variant: str = "snapshot", marker: bool = True) -> psycopg2.extensi
     connection. The slot retains WAL from consistent_point on, so a long copy loses nothing.
     The rebuild starts from an empty collection so rows deleted earlier can't linger.
 
+    Alias swap (alias_swap=True, the default): the copy goes into a fresh physical collection while
+    the alias keeps pointing at the old one, which keeps serving. Order: clear marker, drop slot,
+    create slot + new collection, copy, write marker (naming the new collection), swap the alias,
+    delete the old collection(s), stream. The old collection gets no updates from the moment its
+    slot is dropped until the swap, so readers see data that is as old as the rebuild is long (see
+    recover_alias_state for the crash points). alias_swap=False (--no-alias-swap) is the old
+    behavior: delete the index, recreate it in place, and fill it while readers watch.
+
     Completion marker: cleared before anything destructive (slot drop, collection recreate), written
     only after the last upsert is acknowledged and before streaming starts. A crash in between leaves
     slot-without-marker, which a plain start recognizes as an interrupted backfill. A crash after the
     marker is written leaves slot-and-marker, which is safe to stream from: the slot kept the WAL.
     marker=False (--no-backfill-marker) never writes it, but still clears it so a stale one from an
-    earlier run can't vouch for a half-built index.
+    earlier run can't vouch for a half-built index. Alias mode needs the marker (it names the target).
 
     `variant` exists only so experiment_backfill.py can run negative controls. "snapshot" is the
     real thing; "slot-first" and "select-first" skip the exported snapshot (see create/copy below).
 
     Returns the replication connection, which still owns the slot, ready to stream.
     """
+    if alias_swap and not marker:
+        raise ValueError("alias swap needs the completion marker")
     clear_backfill_marker()
     drop_slot_if_exists()
-    ensure_collection(recreate=True)
+    if alias_swap:
+        drop_collections_except(serving_collection())  # half-built leftovers of an earlier crashed rebuild
+        build = new_collection_name()
+        create_index_collection(build)
+        log.info("backfill: building into %s; readers stay on %s", build, serving_collection())
+    else:
+        drop_index()
+        build = COLLECTION
+        create_index_collection(build)
     t0 = time.monotonic()
     repl = psycopg2.connect(DSN, connection_factory=psycopg2.extras.LogicalReplicationConnection)
     rcur = repl.cursor()
@@ -306,7 +442,7 @@ def backfill(variant: str = "snapshot", marker: bool = True) -> psycopg2.extensi
             cur.execute("SELECT id, body, updated_at FROM articles ORDER BY id")
             while rows := cur.fetchmany(200):
                 items = [(id_, i, text, iso_utc(ts)) for id_, body, ts in rows for i, text in enumerate(chunk_body(body))]
-                upsert_chunks(items)
+                upsert_chunks(items, collection=build)
                 n_articles += len(rows)
                 n_chunks += len(items)
                 hook("backfill_mid_copy")
@@ -332,12 +468,20 @@ def backfill(variant: str = "snapshot", marker: bool = True) -> psycopg2.extensi
         # of a half-built index and look healthy. Drop it so the failure is loud.
         repl.close()
         drop_slot_if_exists()
+        if alias_swap:
+            qdrant.delete_collection(build)  # the old index is untouched and still served
         raise
     log.info("backfill: indexed %d articles / %d chunks in %.1fs", n_articles, n_chunks, time.monotonic() - t0)
     if marker:
         hook("backfill_pre_marker")
-        write_backfill_marker(n_articles)
+        write_backfill_marker(n_articles, build)
         log.info("backfill: completion marker written")
+    if alias_swap:
+        hook("backfill_pre_swap")
+        swap_alias(build)
+        log.info("backfill: alias %s now points at %s", COLLECTION, build)
+        hook("backfill_pre_cleanup")
+        drop_collections_except(build)
     hook("backfill_pre_stream")
     return repl
 
@@ -350,6 +494,9 @@ def main() -> None:
     group.add_argument("--naive-backfill", nargs="?", const="slot-first", choices=["slot-first", "select-first"],
                        help="NEGATIVE CONTROL: backfill without an exported snapshot (slot-first: create the slot, then "
                             "plain SELECT; select-first: plain SELECT, then create the slot). Default: slot-first")
+    ap.add_argument("--no-alias-swap", action="store_true",
+                    help="OLD BEHAVIOR: a backfill deletes and recreates the physical collection readers query, so "
+                         "they see an empty, then partial, index while it runs")
     ap.add_argument("--no-backfill-marker", action="store_true",
                     help="OLD BEHAVIOR: don't write or check the backfill-completed marker (an interrupted backfill's "
                          "slot is then streamed from as if the index were complete)")
@@ -358,15 +505,24 @@ def main() -> None:
     args = ap.parse_args()
     mode = args.mode
     use_marker = not args.no_backfill_marker
+    alias_swap = not args.no_alias_swap
+    if alias_swap and not use_marker:
+        ap.error("--no-backfill-marker needs --no-alias-swap (the marker records which collection the slot feeds)")
     variant = "snapshot" if args.backfill else args.naive_backfill
-    if not variant and use_marker and not backfill_marker_present():
-        log.warning("backfill-completed marker is missing (slot %s %s): no complete backfill is on record, "
-                    "so the index may be partial. Running a full backfill instead of streaming.",
-                    SLOT, "exists" if slot_exists() else "does not exist")
-        variant = "snapshot"
+    if not variant and use_marker:
+        why = recover_alias_state() if alias_swap else (None if backfill_marker_present() else "backfill-completed marker is missing")
+        if why:
+            log.warning("%s (slot %s %s): no complete backfill is on record, so the index may be partial. "
+                        "Running a full backfill instead of streaming.", why, SLOT,
+                        "exists" if slot_exists() else "does not exist")
+            variant = "snapshot"
+    if alias_swap:
+        sweep_orphans()  # after the marker handling above, so any roll-forward swap has already happened
     if variant:
-        conn = backfill(variant, marker=use_marker)
+        conn = backfill(variant, marker=use_marker, alias_swap=alias_swap)
     else:
+        if not alias_swap:
+            ensure_collection()
         ensure_slot()
         # A *replication* connection speaks the streaming replication protocol,
         # which is what lets us START_REPLICATION on a logical slot.

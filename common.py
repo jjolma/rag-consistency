@@ -6,9 +6,17 @@ from datetime import datetime, timezone
 DSN = "host=localhost port=5432 dbname=app user=postgres password=postgres"
 QDRANT_URL = "http://localhost:6333"
 SLOT = "articles_slot"
-COLLECTION = "article_chunks"  # one point per (article_id, chunk_index)
+# The name every reader queries, one point per (article_id, chunk_index). In alias mode (the default) it is
+# an alias for a physical collection article_chunks_<stamp>_<id>; with --no-alias-swap it is the physical
+# collection itself. Readers never need to know which.
+COLLECTION = "article_chunks"
 MODEL_NAME = "all-MiniLM-L6-v2"  # 384-dim
 CHUNK_SIZE = 200  # characters
+
+
+def alias_target(client, alias: str = COLLECTION) -> str | None:
+    """The physical collection `alias` points at, or None if it is not an alias (absent, or a physical collection)."""
+    return next((a.collection_name for a in client.get_aliases().aliases if a.alias_name == alias), None)
 
 
 def iso_utc(ts) -> str | None:

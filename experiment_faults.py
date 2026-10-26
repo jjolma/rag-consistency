@@ -1,7 +1,7 @@
 """Fault-injection (kill -9) experiments against the CDC consumer.
 
   python experiment_faults.py calibrate [--rows 800] [--changes 100]
-  python experiment_faults.py backfill --recovery plain|rebackfill [--trials 20] [--rows 800] [--no-backfill-marker]
+  python experiment_faults.py backfill --recovery plain|rebackfill [--trials 20] [--rows 800] [--no-backfill-marker] [--no-alias-swap]
   python experiment_faults.py control --ack-first [--trials 20] [--window 3]
   python experiment_faults.py steady --kill random [--trials N | --minutes M] [--window 3]
 
@@ -12,13 +12,15 @@ Every trial ends the same way, so results are comparable:
   3. barrier: wait until the marker is indexed. The consumer applies changes in WAL order, so once
      the marker is there everything before it has been replayed. (Polling for "consistent" would not
      do: replay passes through states that happen to match Postgres.)
-  4. verify.check(); again 3 s later. clean = both consistent. Anything else is a PERSISTENT
+  4. verify.check(); again 3 s later. clean = both consistent and no orphan collection (a leftover
+     article_chunks_* the alias doesn't point at) at the second check. Anything else is a PERSISTENT
      inconsistency: the restart did not repair it.
 Between the kill and the barrier the verifier is sampled, giving the TRANSIENT exposure
 (recovery_s = kill -> barrier, inconsistent_s = part of that the index was wrong, absent_s = part of
 that the collection did not exist, e.g. while a --backfill had it deleted).
 
-Scenarios (the `scenario` column of results/faults.csv):
+Scenarios (the `scenario` column of results/faults.csv). Runs with the consumer's alias swap (its default)
+get an "-alias" suffix (backfill-plain-alias); --no-alias-swap runs keep the plain names the older rows have.
   backfill-plain       kill --backfill mid-copy at a random batch, restart with a plain consumer
   backfill-rebackfill  same kill, but recover by running --backfill again
   ack-first            NEGATIVE CONTROL: victim is `--ack-first` (acks before applying), killed at a
@@ -33,6 +35,7 @@ the consumer crossed (STAGE_FILE), so each random kill is attributed to a stage.
 final_lag_bytes is the slot's lag (WAL bytes not yet confirmed) at the final verification, blank if
 the slot is gone; it should be near zero after a healthy recovery. --no-backfill-marker runs every
 consumer with the old behavior (no completion marker), so the original failure stays reproducible.
+--no-alias-swap does the same for the alias swap: every backfill deletes and recreates the collection readers query.
 
 A trial that leaves the index dirty is repaired by a full --backfill before the next one (recorded
 as repaired=1). calibrate writes results/faults_calibration.json.
@@ -68,9 +71,11 @@ STAGE_PATH = RESULTS / "stage"
 FIELDS = ["timestamp", "scenario", "trial", "seed", "fault", "kill_stage", "kill_after_s", "written",
           "applied_before_kill", "applied_after_restart", "slot_left", "missing_at_kill",
           "recovery_s", "inconsistent_s", "absent_s", "max_missing", "max_orphaned", "max_stale", "max_payload",
-          "final_missing", "final_orphaned", "final_stale", "final_payload", "final_lag_bytes", "clean", "repaired"]
+          "final_missing", "final_orphaned", "final_stale", "final_payload", "orphan_collections", "final_lag_bytes",
+          "clean", "repaired"]
 APPLIED_RE = re.compile(r"\b(INSERT|UPDATE|DELETE) id=")
 NO_BACKFILL_MARKER = False  # set by --no-backfill-marker: every consumer started gets the flag
+NO_ALIAS_SWAP = False  # set by --no-alias-swap: likewise
 STARTUP_TIMEOUT_S = 120
 SETTLE_S = 3  # second verification this long after the barrier, to catch late changes
 BACKFILL_BATCH = 200  # articles per fetchmany() in cdc_consumer.backfill()
@@ -85,7 +90,13 @@ def start(*args: str, env: dict[str, str] | None = None):
     STAGE_PATH.unlink(missing_ok=True)  # a running consumer keeps writing to the inode it opened, so only unlink on a fresh start
     if NO_BACKFILL_MARKER:
         args = (*args, "--no-backfill-marker")
+    if NO_ALIAS_SWAP:
+        args = (*args, "--no-alias-swap")
     return start_consumer(*args, env={"STAGE_FILE": str(STAGE_PATH), **(env or {})})
+
+
+def label(scenario: str) -> str:
+    return scenario if NO_ALIAS_SWAP else f"{scenario}-alias"
 
 
 def read_stage() -> str:
@@ -247,8 +258,10 @@ def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_a
         max_stale=max(len(r.stale) for r in results), max_payload=max(len(r.payload_stale) for r in results),
         final_missing=len(final.missing), final_orphaned=len(final.orphaned),
         final_stale=len(final.stale), final_payload=len(final.payload_stale),
+        orphan_collections=len(final.orphan_collections),
         final_lag_bytes="" if final.lag is None else final.lag,
-        clean=int(first.consistent and final.consistent),
+        # orphan collections only at the final check: right at the barrier the superseded index may not be deleted yet
+        clean=int(first.consistent and final.consistent and not final.orphan_collections),
     )
 
 
@@ -341,7 +354,7 @@ def summarize(scenario: str, rows: list[dict]) -> None:
     lo, hi = wilson(len(bad), n)
     print(f"\n=== {scenario}: {n} trials ===")
     print(f"persistent inconsistency after recovery: {len(bad)}/{n} = {len(bad) / n:.0%}   (95% CI {lo:.0%}-{hi:.0%})")
-    for key in ("final_missing", "final_orphaned", "final_stale", "final_payload"):
+    for key in ("final_missing", "final_orphaned", "final_stale", "final_payload", "orphan_collections"):
         hit = [r[key] for r in rows if r[key]]
         if hit:
             print(f"  {key:15} in {len(hit)}/{n} trials, median {statistics.median(hit)} chunks when present")
@@ -371,6 +384,7 @@ def run_trials(name: str, trial_fn, trials: int | None, minutes: float | None) -
         print(f"[{name} {i}{'/' + str(trials) if trials else ''}] {durations[-1]:.0f}s  stage={row['kill_stage']}  "
               f"recovery={row['recovery_s']}s inconsistent={row['inconsistent_s']}s  "
               f"final m/o/s/p={row['final_missing']}/{row['final_orphaned']}/{row['final_stale']}/{row['final_payload']}  "
+              f"orphan_colls={row['orphan_collections']}  "
               f"lag={'slot gone' if row['final_lag_bytes'] == '' else str(row['final_lag_bytes']) + 'B'}  "
               f"{'clean' if row['clean'] else 'DIRTY'}{' (repaired)' if row['repaired'] else ''}", flush=True)
     summarize(name, rows)
@@ -453,11 +467,12 @@ def cmd_calibrate(args) -> None:
 def cmd_backfill(args) -> None:
     seed_rows(args.rows)
     h = Harness()
+    h.rebuild()  # trial 1 must kill a rebuild of a healthy index too, not of whatever the last run left behind
     base = args.seed
     print(f"base seed {base}")
+    scenario = label(f"backfill-{args.recovery}")
     try:
-        run_trials(f"backfill-{args.recovery}", lambda i: backfill_trial(h, f"backfill-{args.recovery}", i, base + i, args.recovery),
-                   args.trials, None)
+        run_trials(scenario, lambda i: backfill_trial(h, scenario, i, base + i, args.recovery), args.trials, None)
     finally:
         h.stop_healthy()
 
@@ -482,6 +497,8 @@ def main() -> None:
         p.add_argument("--rows", type=int, default=800, help="make sure the table has at least this many articles")
         p.add_argument("--no-backfill-marker", action="store_true",
                        help="OLD BEHAVIOR: run every consumer with --no-backfill-marker, so an interrupted backfill is streamed from")
+        p.add_argument("--no-alias-swap", action="store_true",
+                       help="OLD BEHAVIOR: run every consumer with --no-alias-swap, so a backfill empties and refills the collection readers query")
         p.add_argument("--seed", type=int, default=int(time.time()) % 100000, help="trial i uses seed+i (recorded in the CSV)")
         if with_trials:
             p.add_argument("--trials", type=int, default=trials)
@@ -510,8 +527,11 @@ def main() -> None:
     args = ap.parse_args()
     if args.cmd == "steady" and not (args.trials or args.minutes):
         ap.error("steady needs --trials or --minutes")
-    global NO_BACKFILL_MARKER
+    global NO_BACKFILL_MARKER, NO_ALIAS_SWAP
     NO_BACKFILL_MARKER = args.no_backfill_marker
+    NO_ALIAS_SWAP = args.no_alias_swap
+    if not NO_ALIAS_SWAP and NO_BACKFILL_MARKER:
+        ap.error("--no-backfill-marker needs --no-alias-swap")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     require_no_other_consumer()
     if args.cmd == "calibrate":
@@ -519,9 +539,9 @@ def main() -> None:
     elif args.cmd == "backfill":
         cmd_backfill(args)
     elif args.cmd == "control":
-        burst_command(args, "ack-first", ("--ack-first",))
+        burst_command(args, label("ack-first"), ("--ack-first",))
     else:
-        burst_command(args, "steady-random", ())
+        burst_command(args, label("steady-random"), ())
 
 
 if __name__ == "__main__":
