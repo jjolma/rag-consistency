@@ -8,6 +8,11 @@ Every article body is re-chunked and each (article_id, chunk_index) is compared 
                   (what a missed payload-only refresh for an unchanged-TOAST update leaves behind)
 Lists contain (article_id, chunk_index) pairs.
 
+`missing` can be split given the set of chunks that were indexed at some earlier moment (split_missing):
+  regressed - missing, but it was in the index then: the index lost something it had (e.g. a crash between
+              an update's delete and its insert)
+  pending   - missing, and it was not: a new article or new chunks the index has not caught up to yet
+
 Separately, orphan collections: physical collections named article_chunks_* that the alias does not point
 at (a half-built or superseded index a rebuild or recovery failed to delete). They don't affect what a
 reader sees, so they are not part of `consistent` (a rebuild in progress always has one); they do make
@@ -109,6 +114,11 @@ class Result:
     def clean(self) -> bool:
         """Consistent, and no collection left over from a rebuild. Only meaningful once nothing is rebuilding."""
         return self.consistent and not self.orphan_collections
+
+
+def split_missing(missing: list[Key], indexed: set[Key]) -> tuple[list[Key], list[Key]]:
+    """(regressed, pending): the missing chunks that were in `indexed`, and those that were not."""
+    return ([k for k in missing if k in indexed], [k for k in missing if k not in indexed])
 
 
 def check() -> Result:

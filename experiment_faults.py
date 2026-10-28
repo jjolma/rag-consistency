@@ -71,10 +71,12 @@ CAL_PATH = RESULTS / "faults_calibration.json"
 STAGE_PATH = RESULTS / "stage"
 FIELDS = ["timestamp", "scenario", "trial", "seed", "fault", "kill_stage", "kill_after_s", "written",
           "applied_before_kill", "applied_after_restart", "slot_left", "missing_at_kill",
-          "recovery_s", "inconsistent_s", "absent_s", "max_missing", "max_orphaned", "max_stale", "max_payload",
+          "recovery_s", "inconsistent_s", "absent_s", "max_missing", "max_regressed", "max_pending", "max_orphaned", "max_stale", "max_payload",
           "final_missing", "final_orphaned", "final_stale", "final_payload", "orphan_collections", "final_lag_bytes",
           "clean", "repaired"]
 APPLIED_RE = re.compile(r"\b(INSERT|UPDATE|DELETE) id=")
+UPSERTED_RE = re.compile(r"\b(INSERT|UPDATE) id=(\d+) -> (\d+) chunk\(s\) upserted")
+DELETED_RE = re.compile(r"\bDELETE id=(\d+) -> deleted all points")
 NO_BACKFILL_MARKER = False  # set by --no-backfill-marker: every consumer started gets the flag
 NO_ALIAS_SWAP = False  # set by --no-alias-swap: likewise
 UPDATE_MODE = "correct"  # set by steady --mode: every consumer started gets --mode <this>
@@ -127,6 +129,24 @@ def count_applied(offset: int) -> int:
     with open(CONSUMER_LOG, "rb") as f:
         f.seek(offset)
         return len(APPLIED_RE.findall(f.read().decode(errors="replace")))
+
+
+def indexed_at_kill(baseline: set[tuple[int, int]], offset: int) -> set[tuple[int, int]]:
+    """Chunks the index held at the kill: `baseline` (the index before the burst, consistent and idle) with the
+    changes the victim logged since `offset` replayed on it. A change in flight at the kill is not logged yet,
+    so an article being rewritten still counts with its previous chunks: it was fully indexed until the kill."""
+    with open(CONSUMER_LOG, "rb") as f:
+        f.seek(offset)
+        text = f.read().decode(errors="replace")
+    by_article: dict[int, set[int]] = {}
+    for a, i in baseline:
+        by_article.setdefault(a, set()).add(i)
+    for line in text.splitlines():
+        if m := UPSERTED_RE.search(line):
+            by_article[int(m[2])] = set(range(int(m[3])))
+        elif m := DELETED_RE.search(line):
+            by_article.pop(int(m[1]), None)
+    return {(a, i) for a, idx in by_article.items() for i in idx}
 
 
 def slot_state() -> tuple[bool, bool]:
@@ -235,8 +255,10 @@ class Harness:
 
 
 # --- trials ----------------------------------------------------------------
-def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_args: tuple[str, ...], timeout: float) -> None:
-    """Restart, barrier, verify (twice), and fill in the measurement columns of `row`. Leaves the recovery consumer in h.healthy."""
+def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_args: tuple[str, ...], timeout: float,
+                 indexed: set[tuple[int, int]] | None = None) -> None:
+    """Restart, barrier, verify (twice), and fill in the measurement columns of `row`. Leaves the recovery consumer in h.healthy.
+    `indexed` (the chunks in the index at the kill) splits max_missing into max_regressed and max_pending; without it both are blank."""
     wait_slot_free()
     marker = insert_marker()
     samples.append((time.monotonic(), verify.check()))  # exposure right after the crash, marker not yet indexed
@@ -254,7 +276,10 @@ def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_a
             inconsistent += t_next - t
         if r.index_absent:  # also inconsistent whenever the table has rows; this says why
             absent += t_next - t
+    split = [verify.split_missing(r.missing, indexed) for r in results] if indexed is not None else []
     row.update(
+        max_regressed=max(len(g) for g, _ in split) if split else "",
+        max_pending=max(len(p) for _, p in split) if split else "",
         applied_after_restart=count_applied(recovery.log_offset),
         recovery_s=round(t_barrier - t_kill, 2),
         inconsistent_s=round(inconsistent, 2), absent_s=round(absent, 2),
@@ -274,6 +299,7 @@ def burst_trial(h: Harness, scenario: str, trial: int, seed: int, victim_args: t
     kill_after = random.uniform(0.05, window)
     victim = h.victim(victim_args)
     mark = log_size()
+    baseline = set(verify.read_qdrant()[0])  # idle and consistent: nothing is being written yet
     writer = Writer()
     writer.start()
     time.sleep(kill_after)
@@ -290,7 +316,7 @@ def burst_trial(h: Harness, scenario: str, trial: int, seed: int, victim_args: t
     row = {"scenario": scenario, "trial": trial, "seed": seed, "fault": "random", "kill_stage": stage,
            "kill_after_s": round(kill_after, 2), "written": writer.ops,
            "applied_before_kill": count_applied(mark), "slot_left": 1, "missing_at_kill": ""}
-    finish_trial(h, row, t_kill, [], (), timeout=STARTUP_TIMEOUT_S + 120)
+    finish_trial(h, row, t_kill, [], (), timeout=STARTUP_TIMEOUT_S + 120, indexed=indexed_at_kill(baseline, mark))
     row["repaired"] = 0
     if not row["clean"]:
         h.rebuild()  # the next trial must start from a known-good index
@@ -365,6 +391,10 @@ def summarize(scenario: str, rows: list[dict]) -> None:
     print(f"recovery_s (kill -> barrier): median {statistics.median(r['recovery_s'] for r in rows):.1f}   "
           f"inconsistent_s: median {statistics.median(r['inconsistent_s'] for r in rows):.1f}   "
           f"max_missing: median {statistics.median(r['max_missing'] for r in rows)}")
+    for key in ("max_regressed", "max_pending"):
+        vals = [r[key] for r in rows if r[key] != ""]
+        if vals:
+            print(f"  {key:13} median {statistics.median(vals)}, max {max(vals)}, nonzero in {sum(1 for x in vals if x)}/{len(vals)} trials")
     stages = Counter(r["kill_stage"] for r in rows)
     if len(stages) > 1 or "random" == rows[0]["fault"]:
         print("kill landed in (last stage crossed):  " + "  ".join(f"{s} {c}" for s, c in stages.most_common()))
@@ -387,6 +417,7 @@ def run_trials(name: str, trial_fn, trials: int | None, minutes: float | None) -
         rows.append(row)
         print(f"[{name} {i}{'/' + str(trials) if trials else ''}] {durations[-1]:.0f}s  stage={row['kill_stage']}  "
               f"recovery={row['recovery_s']}s inconsistent={row['inconsistent_s']}s  "
+              f"max regressed/pending={row['max_regressed']}/{row['max_pending']}  "
               f"final m/o/s/p={row['final_missing']}/{row['final_orphaned']}/{row['final_stale']}/{row['final_payload']}  "
               f"orphan_colls={row['orphan_collections']}  "
               f"lag={'slot gone' if row['final_lag_bytes'] == '' else str(row['final_lag_bytes']) + 'B'}  "
