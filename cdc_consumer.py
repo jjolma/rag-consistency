@@ -1,6 +1,6 @@
 """CDC consumer: Postgres logical replication (test_decoding) -> Qdrant.
 
-Run:  python cdc_consumer.py [--mode naive|correct] [--backfill]
+Run:  python cdc_consumer.py [--mode naive|correct|trim] [--backfill]
 
 --backfill first indexes every row that already exists (snapshot-then-stream, see backfill()),
 then streams. Use it for the first run, or to rebuild the index from scratch.
@@ -18,6 +18,8 @@ partial index. --no-backfill-marker restores the old behavior (legacy mode only)
 Each article body is split into chunks; every chunk is one Qdrant point. On UPDATE:
   correct (default): delete all points of the article, then insert the new chunks
   naive:             just upsert the new chunks (leaves orphans if the text got shorter)
+  trim:              upsert the new chunks, then delete the article's points with chunk_index >= the new count
+                     (no window with the article missing, but a crash between the two steps leaves the tail)
 DELETE removes all the article's points in both modes.
 """
 import argparse
@@ -36,7 +38,7 @@ import psycopg2.extras
 from qdrant_client import QdrantClient
 from qdrant_client.models import (CreateAlias, CreateAliasOperation, DeleteAlias, DeleteAliasOperation, Distance,
                                   FieldCondition, Filter, FilterSelector, MatchValue, PayloadSchemaType, PointStruct,
-                                  VectorParams)
+                                  Range, VectorParams)
 from sentence_transformers import SentenceTransformer
 
 from common import COLLECTION, DSN, MODEL_NAME, QDRANT_URL, SLOT, alias_target, chunk_body, chunk_hash, iso_utc, point_id
@@ -350,6 +352,12 @@ def handle(payload: str, mode: str) -> None:
     if op == "UPDATE" and mode == "correct":
         delete_article_points(article_id)  # drops chunks beyond the new count (and any stale ones)
     upsert_chunks([(article_id, i, text, updated_at) for i, text in enumerate(chunks)])
+    if op == "UPDATE" and mode == "trim":
+        hook("before_trim")
+        qdrant.delete(COLLECTION, points_selector=FilterSelector(filter=Filter(must=[
+            FieldCondition(key="article_id", match=MatchValue(value=article_id)),
+            FieldCondition(key="chunk_index", range=Range(gte=len(chunks)))])))
+        hook("after_trim")
     log.info("%s id=%s -> %d chunk(s) upserted (%s)", op, article_id, len(chunks), mode)
 
 
@@ -518,7 +526,7 @@ def backfill(variant: str = "snapshot", marker: bool = True, alias_swap: bool = 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["naive", "correct"], default="correct", help="how UPDATE treats existing chunks")
+    ap.add_argument("--mode", choices=["naive", "correct", "trim"], default="correct", help="how UPDATE treats existing chunks")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--backfill", action="store_true", help="index all existing rows first (replaces the slot and the index)")
     group.add_argument("--naive-backfill", nargs="?", const="slot-first", choices=["slot-first", "select-first"],
