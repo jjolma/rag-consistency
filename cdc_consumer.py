@@ -25,8 +25,10 @@ import logging
 import os
 import re
 import signal
+import sys
 import time
 import uuid
+import zlib
 from datetime import datetime, timezone
 
 import psycopg2
@@ -97,6 +99,34 @@ def parse_columns(s: str) -> dict:
         else:
             cols[name] = raw
     return cols
+
+
+# --- single-instance guard -------------------------------------------------
+# Everything below assumes it is the only consumer: the marker handling, the orphan sweep (which deletes
+# any article_chunks_* it doesn't recognize, including another consumer's build in progress) and the
+# slot itself. A session-level advisory lock on a dedicated connection enforces that. Postgres releases
+# it when the connection ends, including when the process is kill -9'd, so a crash never leaves it stuck
+# (the server may take a moment to notice the dead socket, so an instant restart can briefly be refused).
+LOCK_KEY = zlib.crc32(f"cdc_consumer:{SLOT}".encode())
+_lock_conn = None  # kept referenced for the process's lifetime: closing it would release the lock
+
+
+def acquire_single_instance_lock() -> bool:
+    global _lock_conn
+    conn = psycopg2.connect(DSN)
+    conn.autocommit = True  # no open transaction; the lock belongs to the session
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,))
+        if cur.fetchone()[0]:
+            _lock_conn = conn
+            return True
+    conn.close()
+    return False
+
+
+if __name__ == "__main__" and not acquire_single_instance_lock():  # before the model load, the marker, the sweep, or any write
+    log.error("another consumer is already running (advisory lock %d is held); exiting without touching anything", LOCK_KEY)
+    sys.exit(1)
 
 
 # --- sinks -----------------------------------------------------------------
