@@ -21,6 +21,9 @@ that the collection did not exist, e.g. while a --backfill had it deleted).
 
 Scenarios (the `scenario` column of results/faults.csv). Runs with the consumer's alias swap (its default)
 get an "-alias" suffix (backfill-plain-alias); --no-alias-swap runs keep the plain names the older rows have.
+Runs with the consumer's version guard (its default) get "-guard" before that (steady-random-trim-guard-alias);
+--no-version-guard runs keep the names the older, unguarded rows have. skipped_after_restart counts the
+replayed changes the guard skipped.
   backfill-plain       kill --backfill mid-copy at a random batch, restart with a plain consumer
   backfill-rebackfill  same kill, but recover by running --backfill again
   ack-first            NEGATIVE CONTROL: victim is `--ack-first` (acks before applying), killed at a
@@ -70,15 +73,17 @@ CSV_PATH = RESULTS / "faults.csv"
 CAL_PATH = RESULTS / "faults_calibration.json"
 STAGE_PATH = RESULTS / "stage"
 FIELDS = ["timestamp", "scenario", "trial", "seed", "fault", "kill_stage", "kill_after_s", "written",
-          "applied_before_kill", "applied_after_restart", "slot_left", "missing_at_kill",
+          "applied_before_kill", "applied_after_restart", "skipped_after_restart", "slot_left", "missing_at_kill",
           "recovery_s", "inconsistent_s", "absent_s", "max_missing", "max_regressed", "max_pending", "max_orphaned", "max_stale", "max_payload",
           "final_missing", "final_orphaned", "final_stale", "final_payload", "orphan_collections", "final_lag_bytes",
           "clean", "repaired"]
 APPLIED_RE = re.compile(r"\b(INSERT|UPDATE|DELETE) id=")
+SKIPPED_RE = re.compile(r"\bskipped (INSERT|UPDATE|DELETE) of id=")  # the version guard skipped a replayed change
 UPSERTED_RE = re.compile(r"\b(INSERT|UPDATE) id=(\d+) -> (\d+) chunk\(s\) upserted")
 DELETED_RE = re.compile(r"\bDELETE id=(\d+) -> deleted all points")
 NO_BACKFILL_MARKER = False  # set by --no-backfill-marker: every consumer started gets the flag
 NO_ALIAS_SWAP = False  # set by --no-alias-swap: likewise
+NO_GUARD = False  # set by --no-version-guard: likewise (the consumer's version guard is on by default)
 UPDATE_MODE = "trim"  # set by steady --mode: every consumer started gets --mode <this>
 STARTUP_TIMEOUT_S = 120
 SETTLE_S = 3  # second verification this long after the barrier, to catch late changes
@@ -97,11 +102,14 @@ def start(*args: str, env: dict[str, str] | None = None):
     if NO_ALIAS_SWAP:
         args = (*args, "--no-alias-swap")
     args = (*args, "--mode", UPDATE_MODE)
+    if NO_GUARD:
+        args = (*args, "--no-version-guard")
     return start_consumer(*args, env={"STAGE_FILE": str(STAGE_PATH), **(env or {})})
 
 
 def label(scenario: str) -> str:
-    return scenario if NO_ALIAS_SWAP else f"{scenario}-alias"
+    """Runs with the version guard get "-guard" before the alias suffix, so older (unguarded) rows keep their names."""
+    return scenario + ("" if NO_GUARD else "-guard") + ("" if NO_ALIAS_SWAP else "-alias")
 
 
 def read_stage() -> str:
@@ -128,6 +136,13 @@ def count_applied(offset: int) -> int:
     with open(CONSUMER_LOG, "rb") as f:
         f.seek(offset)
         return len(APPLIED_RE.findall(f.read().decode(errors="replace")))
+
+
+def count_skipped(offset: int) -> int:
+    """Replayed changes the version guard skipped since `offset` (not counted as applied)."""
+    with open(CONSUMER_LOG, "rb") as f:
+        f.seek(offset)
+        return len(SKIPPED_RE.findall(f.read().decode(errors="replace")))
 
 
 def indexed_at_kill(baseline: set[tuple[int, int]], offset: int) -> set[tuple[int, int]]:
@@ -280,6 +295,7 @@ def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_a
         max_regressed=max(len(g) for g, _ in split) if split else "",
         max_pending=max(len(p) for _, p in split) if split else "",
         applied_after_restart=count_applied(recovery.log_offset),
+        skipped_after_restart=count_skipped(recovery.log_offset),
         recovery_s=round(t_barrier - t_kill, 2),
         inconsistent_s=round(inconsistent, 2), absent_s=round(absent, 2),
         max_missing=max(len(r.missing) for r in results), max_orphaned=max(len(r.orphaned) for r in results),
@@ -416,7 +432,7 @@ def run_trials(name: str, trial_fn, trials: int | None, minutes: float | None) -
         rows.append(row)
         print(f"[{name} {i}{'/' + str(trials) if trials else ''}] {durations[-1]:.0f}s  stage={row['kill_stage']}  "
               f"recovery={row['recovery_s']}s inconsistent={row['inconsistent_s']}s  "
-              f"max regressed/pending={row['max_regressed']}/{row['max_pending']}  "
+              f"max regressed/pending={row['max_regressed']}/{row['max_pending']}  skipped={row['skipped_after_restart']}  "
               f"final m/o/s/p={row['final_missing']}/{row['final_orphaned']}/{row['final_stale']}/{row['final_payload']}  "
               f"orphan_colls={row['orphan_collections']}  "
               f"lag={'slot gone' if row['final_lag_bytes'] == '' else str(row['final_lag_bytes']) + 'B'}  "
@@ -533,6 +549,9 @@ def main() -> None:
                        help="OLD BEHAVIOR: run every consumer with --no-backfill-marker, so an interrupted backfill is streamed from")
         p.add_argument("--no-alias-swap", action="store_true",
                        help="OLD BEHAVIOR: run every consumer with --no-alias-swap, so a backfill empties and refills the collection readers query")
+        p.add_argument("--no-version-guard", action="store_true",
+                       help="OLD BEHAVIOR: run every consumer with --no-version-guard (replay rewinds articles through their history); "
+                            "rows are labelled without the -guard suffix")
         p.add_argument("--seed", type=int, default=int(time.time()) % 100000, help="trial i uses seed+i (recorded in the CSV)")
         if with_trials:
             p.add_argument("--trials", type=int, default=trials)
@@ -562,10 +581,11 @@ def main() -> None:
     args = ap.parse_args()
     if args.cmd == "steady" and not (args.trials or args.minutes):
         ap.error("steady needs --trials or --minutes")
-    global NO_BACKFILL_MARKER, NO_ALIAS_SWAP, UPDATE_MODE
+    global NO_BACKFILL_MARKER, NO_ALIAS_SWAP, NO_GUARD, UPDATE_MODE
     UPDATE_MODE = getattr(args, "mode", "trim")
     NO_BACKFILL_MARKER = args.no_backfill_marker
     NO_ALIAS_SWAP = args.no_alias_swap
+    NO_GUARD = args.no_version_guard
     if not NO_ALIAS_SWAP and NO_BACKFILL_MARKER:
         ap.error("--no-backfill-marker needs --no-alias-swap")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))

@@ -21,6 +21,12 @@ Each article body is split into chunks; every chunk is one Qdrant point. On UPDA
   correct:           delete all points of the article, then insert the new chunks
   naive:             just upsert the new chunks (leaves orphans if the text got shorter)
 DELETE removes all the article's points in both modes.
+
+Version guard (on by default; --no-version-guard turns it off): every change carries the LSN of its WAL
+record, and the index keeps, per article, the LSN of the last change applied (the versions collection,
+see the versions section). A replayed change whose LSN is strictly below it is skipped, so a restart can
+no longer rewind an article through its history. The version is written last, after the chunks.
+--repair rebuilds the articles the verifier finds wrong, ignoring the guard.
 """
 import argparse
 import logging
@@ -41,7 +47,8 @@ from qdrant_client.models import (CreateAlias, CreateAliasOperation, DeleteAlias
                                   Range, VectorParams)
 from sentence_transformers import SentenceTransformer
 
-from common import COLLECTION, DSN, MODEL_NAME, QDRANT_URL, SLOT, alias_target, chunk_body, chunk_hash, iso_utc, point_id
+from common import (COLLECTION, DSN, MODEL_NAME, QDRANT_URL, SLOT, VERSIONS, alias_target, chunk_body, chunk_hash,
+                    iso_utc, point_id)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 for noisy in ("httpx", "huggingface_hub", "sentence_transformers"):
@@ -136,12 +143,26 @@ model = SentenceTransformer(MODEL_NAME)
 qdrant = QdrantClient(url=QDRANT_URL)
 
 
+def versions_name(chunks: str) -> str:
+    """The physical versions collection that pairs with the physical chunks collection `chunks`:
+    article_chunks_<x> -> article_versions_<x>, and the legacy article_chunks -> article_versions."""
+    return VERSIONS + chunks[len(COLLECTION):]
+
+
+def create_versions_collection(name: str) -> None:
+    qdrant.create_collection(name, vectors_config=VectorParams(size=1, distance=Distance.COSINE))  # a point needs a vector
+    qdrant.create_payload_index(name, "deleted", PayloadSchemaType.BOOL)  # for the tombstone sweep
+    qdrant.create_payload_index(name, "lsn", PayloadSchemaType.INTEGER)
+
+
 def create_index_collection(name: str) -> None:
+    """A chunks collection and the versions collection that pairs with it."""
     qdrant.create_collection(
         name,
         vectors_config=VectorParams(size=model.get_embedding_dimension(), distance=Distance.COSINE),
     )
     qdrant.create_payload_index(name, "article_id", PayloadSchemaType.INTEGER)  # for delete-by-article
+    create_versions_collection(versions_name(name))
 
 
 def ensure_collection() -> None:
@@ -157,9 +178,10 @@ def ensure_collection() -> None:
 # Qdrant won't let a physical collection and an alias share a name, and delete_collection(<alias>) is a
 # silent no-op, so every place that removes things goes through physical_names() / alias_target().
 def physical_names() -> list[str]:
-    """Physical collections that belong to the index: the legacy one called COLLECTION, and the builds."""
+    """Physical collections that belong to the index: the legacy ones called COLLECTION and VERSIONS, and the
+    builds of both."""
     return [c.name for c in qdrant.get_collections().collections
-            if c.name == COLLECTION or c.name.startswith(f"{COLLECTION}_")]
+            if c.name in (COLLECTION, VERSIONS) or c.name.startswith((f"{COLLECTION}_", f"{VERSIONS}_"))]
 
 
 def new_collection_name() -> str:
@@ -172,27 +194,36 @@ def serving_collection() -> str | None:
 
 
 def swap_alias(collection: str) -> None:
-    """Point COLLECTION at `collection`. Delete-and-create go in one request, which Qdrant applies
-    atomically: a reader sees the old target or the new one, never no alias. Idempotent."""
-    current = alias_target(qdrant)
-    if current == collection:
-        return
-    create = CreateAliasOperation(create_alias=CreateAlias(collection_name=collection, alias_name=COLLECTION))
-    if current is not None:
-        qdrant.update_collection_aliases([DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION)), create])
-        return
-    if qdrant.collection_exists(COLLECTION):
-        # One-time migration from legacy mode: the old physical collection holds the alias's name and
-        # cannot be renamed, so there is a gap of two requests with nothing to read. Only the first swap.
-        log.warning("alias swap: replacing legacy physical collection %s with an alias (one-time gap)", COLLECTION)
-        qdrant.delete_collection(COLLECTION)
-    qdrant.update_collection_aliases([create])
+    """Point COLLECTION at `collection` and VERSIONS at its paired versions collection. Every delete and
+    create goes in one request, which Qdrant applies atomically: a reader sees the old pair or the new one,
+    never no alias and never a chunks collection with the wrong versions. Idempotent. A chunks collection
+    built before versions existed gets an empty versions collection (an absent version means "apply")."""
+    wanted = {COLLECTION: collection, VERSIONS: versions_name(collection)}
+    if not qdrant.collection_exists(wanted[VERSIONS]):
+        create_versions_collection(wanted[VERSIONS])
+    ops = []
+    for alias, target in wanted.items():
+        current = alias_target(qdrant, alias)
+        if current == target:
+            continue
+        if current is not None:
+            ops.append(DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=alias)))
+        elif qdrant.collection_exists(alias):
+            # One-time migration from legacy mode: the old physical collection holds the alias's name and
+            # cannot be renamed, so there is a gap of two requests with nothing to read. Only the first swap.
+            log.warning("alias swap: replacing legacy physical collection %s with an alias (one-time gap)", alias)
+            qdrant.delete_collection(alias)
+        ops.append(CreateAliasOperation(create_alias=CreateAlias(collection_name=target, alias_name=alias)))
+    if ops:
+        qdrant.update_collection_aliases(ops)
 
 
 def drop_collections_except(keep: str | None) -> None:
-    """Delete every physical index collection but `keep`: superseded indexes and half-built ones."""
+    """Delete every physical index collection but `keep` and its versions pair: superseded indexes and
+    half-built ones."""
+    kept = {keep, versions_name(keep)} if keep else set()
     for name in physical_names():
-        if name != keep:
+        if name not in kept:
             qdrant.delete_collection(name)
             log.info("deleted collection %s", name)
 
@@ -205,17 +236,20 @@ def sweep_orphans() -> None:
     the slot feeds, waiting for a roll-forward swap, and deleting it would lose the only copy."""
     marker = read_backfill_marker()
     keep = {alias_target(qdrant), (marker or {}).get("collection")} - {None}
+    keep |= {versions_name(name) for name in keep}
     for name in physical_names():
-        if name.startswith(f"{COLLECTION}_") and name not in keep:
+        if name.startswith((f"{COLLECTION}_", f"{VERSIONS}_")) and name not in keep:
             log.warning("orphan sweep: deleting %s (not the alias target %s, not named by the marker)",
                         name, alias_target(qdrant))
             qdrant.delete_collection(name)
 
 
 def drop_index() -> None:
-    """Legacy rebuild: remove the alias (if any) and every physical collection."""
-    if alias_target(qdrant):
-        qdrant.update_collection_aliases([DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION))])
+    """Legacy rebuild: remove the aliases (if any) and every physical collection."""
+    gone = [DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=alias))
+            for alias in (COLLECTION, VERSIONS) if alias_target(qdrant, alias)]
+    if gone:
+        qdrant.update_collection_aliases(gone)
     drop_collections_except(None)
 
 
@@ -230,7 +264,7 @@ def drop_index() -> None:
 # half-built one, and streaming that slot onto the old index would silently skip everything between
 # the two positions. So the marker is the commit point of a rebuild, and the alias swap is the
 # publication step that rolls forward from it (see recover_alias_state).
-STATE_COLLECTION = "cdc_state"
+STATE_COLLECTION = os.environ.get("RAG_STATE", "cdc_state")
 MARKER_ID = 1
 
 
@@ -287,6 +321,84 @@ def article_filter(article_id: int) -> Filter:
     return Filter(must=[FieldCondition(key="article_id", match=MatchValue(value=article_id))])
 
 
+# --- versions ----------------------------------------------------------------
+# The version guard. Replay after a crash redelivers every change since the last transmitted ack, in
+# order, so an article is walked back through its history (an old, shorter body's trim deletes chunks a
+# newer body had added) until replay reaches its newest change. To stop that, each change's LSN is the
+# article's version: the index keeps, per article, the LSN of the last change it applied, and a change
+# strictly older than that is skipped. Equal is applied again: that is a redelivery of the last change,
+# and re-applying it repairs a crash right after a write.
+#
+# The LSN is the change's own WAL record (the message's data_start), not its COMMIT's: the commit LSN is only
+# known after the changes were delivered. It is only compared per article, and that is safe: two
+# transactions can't change the same row concurrently, so for one article the change LSNs are in commit order.
+#
+# The version is written LAST, after the chunks (and the trim): a crash in between leaves the old version,
+# so replay of the same change does the work again. It is a point in the versions collection (id = the
+# article id, payload {lsn, deleted}) paired with the physical chunks collection, so it is swapped, dropped
+# and lost together with the data it describes, and readers of COLLECTION never see it. A DELETE leaves a
+# tombstone (deleted=True) so an older replayed change can't resurrect the article. No point means "apply":
+# a backfill writes none, because the slot it starts feeds only changes after its snapshot.
+#
+# What it costs: replay no longer repairs anything older than the version. A bad write that was stamped
+# stays bad; --repair (reindex_article) rebuilds such articles from Postgres and ignores the guard.
+GUARD = True  # --no-version-guard sets it False: no reads, no stamps, replay applies everything (the old behaviour)
+_versions: dict[int, int] = {}  # article_id -> LSN last read or stamped by this process; nothing else writes them
+VERSION_CACHE_MAX = 200_000
+
+
+def read_version(article_id: int) -> int | None:
+    if article_id in _versions:
+        return _versions[article_id]
+    found = qdrant.retrieve(VERSIONS, ids=[article_id], with_payload=True, with_vectors=False)
+    if not found:
+        return None
+    if len(_versions) >= VERSION_CACHE_MAX:
+        _versions.clear()
+    _versions[article_id] = found[0].payload["lsn"]
+    return _versions[article_id]
+
+
+def stamp_version(article_id: int, lsn: int, deleted: bool = False) -> None:
+    """Record `lsn` as the article's version. Always the last step of applying a change."""
+    hook("before_stamp")
+    qdrant.upsert(VERSIONS, points=[PointStruct(id=article_id, vector=[1.0], payload={"lsn": lsn, "deleted": deleted})])
+    if len(_versions) >= VERSION_CACHE_MAX:
+        _versions.clear()
+    _versions[article_id] = lsn
+
+
+def sweep_tombstones() -> None:
+    """Drop tombstones the slot can no longer replay past. Replay starts at confirmed_flush_lsn and only
+    delivers transactions that commit after it; a change older than a tombstone committed before the
+    tombstone's own change, so before confirmed_flush_lsn once the tombstone is below it."""
+    with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT confirmed_flush_lsn - '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = %s", (SLOT,))
+        row = cur.fetchone()
+    conn.close()
+    if not row or row[0] is None:
+        return
+    gone = Filter(must=[FieldCondition(key="deleted", match=MatchValue(value=True)),
+                        FieldCondition(key="lsn", range=Range(lt=int(row[0])))])
+    n = qdrant.count(VERSIONS, count_filter=gone, exact=True).count
+    if n:
+        qdrant.delete(VERSIONS, points_selector=FilterSelector(filter=gone))
+        log.info("swept %d tombstone(s) below the slot's confirmed position", n)
+
+
+def ensure_versions() -> None:
+    """Make sure the index being served has its versions collection, and VERSIONS addresses it. A no-op on
+    an index built with this code; creates an empty one for an index built before versions existed."""
+    serving = serving_collection()
+    if serving is None:
+        return
+    if serving == COLLECTION:  # legacy physical collection: its pair is the physical VERSIONS
+        if not qdrant.collection_exists(VERSIONS):
+            create_versions_collection(VERSIONS)
+    else:
+        swap_alias(serving)
+
+
 def upsert_chunks(items: list[tuple[int, int, str, str | None]], batch: int = UPSERT_BATCH,
                   collection: str = COLLECTION) -> None:
     """Embed and upsert chunks. items are (article_id, chunk_index, text, updated_at). A rebuild passes the
@@ -318,7 +430,8 @@ def delete_article_points(article_id: int) -> None:
     hook("after_delete")
 
 
-def handle(payload: str, mode: str) -> None:
+def handle(payload: str, mode: str, lsn: int | None = None) -> None:
+    """Apply one decoded message. `lsn` is the message's own LSN (None: no version guard for this call)."""
     if payload.startswith(("BEGIN", "COMMIT")):
         log.debug(payload)
         return
@@ -332,8 +445,18 @@ def handle(payload: str, mode: str) -> None:
     cols = parse_columns(rest)
     article_id = int(cols["id"])
 
+    guarded = GUARD and lsn is not None
+    if guarded:
+        version = read_version(article_id)
+        if version is not None and lsn < version:
+            log.info("skipped %s of id=%s: LSN %X/%X is older than the index's version %X/%X",
+                     op, article_id, lsn >> 32, lsn & 0xFFFFFFFF, version >> 32, version & 0xFFFFFFFF)
+            return
+
     if op == "DELETE":
         delete_article_points(article_id)
+        if guarded:
+            stamp_version(article_id, lsn, deleted=True)
         log.info("DELETE id=%s -> deleted all points", article_id)
         return
 
@@ -346,6 +469,8 @@ def handle(payload: str, mode: str) -> None:
         hook("before_set_payload")
         qdrant.set_payload(COLLECTION, payload={"updated_at": updated_at}, points=article_filter(article_id))
         hook("after_set_payload")
+        if guarded:
+            stamp_version(article_id, lsn)
         log.info("UPDATE id=%s -> body unchanged, payload refreshed (%s)", article_id, mode)
         return
     chunks = chunk_body(cols.get("body"))
@@ -358,7 +483,57 @@ def handle(payload: str, mode: str) -> None:
             FieldCondition(key="article_id", match=MatchValue(value=article_id)),
             FieldCondition(key="chunk_index", range=Range(gte=len(chunks)))])))
         hook("after_trim")
+    if guarded:
+        stamp_version(article_id, lsn)
     log.info("%s id=%s -> %d chunk(s) upserted (%s)", op, article_id, len(chunks), mode)
+
+
+# --- repair ------------------------------------------------------------------
+def reindex_article(article_id: int) -> str:
+    """Rebuild one article's chunks from Postgres, deliberately ignoring the version guard, then stamp it.
+    Returns what it did ("indexed N chunk(s)" or "removed").
+
+    The stamp is pg_current_wal_lsn() sampled while holding FOR SHARE on the row: no change to the row can
+    commit meanwhile, and every change to it that did commit has a lower LSN, so everything the stream
+    still has to deliver for this article with a lower LSN is already reflected in what is written here
+    and gets skipped, and everything after applies. An article that is gone from Postgres gets a tombstone
+    stamped the same way (nothing to lock, but nothing can resurrect an id except an explicit insert)."""
+    with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT body, updated_at FROM articles WHERE id = %s FOR SHARE", (article_id,))
+        row = cur.fetchone()
+        cur.execute("SELECT pg_current_wal_lsn() - '0/0'::pg_lsn")
+        lsn = int(cur.fetchone()[0])
+    conn.close()
+    if row is None:
+        delete_article_points(article_id)
+        stamp_version(article_id, lsn, deleted=True)
+        return "removed"
+    body, ts = row
+    chunks = chunk_body(body)
+    upsert_chunks([(article_id, i, text, iso_utc(ts)) for i, text in enumerate(chunks)])
+    qdrant.delete(COLLECTION, points_selector=FilterSelector(filter=Filter(must=[
+        FieldCondition(key="article_id", match=MatchValue(value=article_id)),
+        FieldCondition(key="chunk_index", range=Range(gte=len(chunks)))])))
+    stamp_version(article_id, lsn)
+    return f"indexed {len(chunks)} chunk(s)"
+
+
+def repair(ids: list[int]) -> int:
+    """Reindex `ids`, or, if none are given, every article the verifier finds missing, orphaned, stale or
+    payload-stale. Needs the streaming consumer to be stopped (it holds the single-instance lock), which also
+    means nothing races the writes; run it caught up, or it re-indexes whatever the lag left behind (harmless
+    but wasteful: the stamp then makes the stream skip those changes). Returns the number of articles left wrong."""
+    import verify  # not needed by the streaming consumer
+    if not ids:
+        r = verify.check()
+        ids = sorted({a for a, _ in r.missing + r.orphaned + r.stale + r.payload_stale})
+        log.info("repair: verifier found %d article(s) wrong: %s", len(ids), ids[:20])
+    for article_id in ids:
+        log.info("repair: id=%s -> %s", article_id, reindex_article(article_id))
+    r = verify.check()
+    log.info("repair: %s", "index consistent" if r.consistent else
+             f"still wrong: missing {len(r.missing)} orphaned {len(r.orphaned)} stale {len(r.stale)} payload {len(r.payload_stale)}")
+    return 0 if r.consistent else 1
 
 
 # --- replication -----------------------------------------------------------
@@ -508,6 +683,7 @@ def backfill(variant: str = "snapshot", marker: bool = True, alias_swap: bool = 
         drop_slot_if_exists()
         if alias_swap:
             qdrant.delete_collection(build)  # the old index is untouched and still served
+            qdrant.delete_collection(versions_name(build))
         raise
     log.info("backfill: indexed %d articles / %d chunks in %.1fs", n_articles, n_chunks, time.monotonic() - t0)
     if marker:
@@ -538,15 +714,29 @@ def main() -> None:
     ap.add_argument("--no-backfill-marker", action="store_true",
                     help="OLD BEHAVIOR: don't write or check the backfill-completed marker (an interrupted backfill's "
                          "slot is then streamed from as if the index were complete)")
+    ap.add_argument("--no-version-guard", action="store_true",
+                    help="OLD BEHAVIOR: no versions; replay applies every redelivered change, rewinding an article through its history")
+    ap.add_argument("--repair", nargs="*", type=int, metavar="ID",
+                    help="don't stream: reindex the given articles, or with no ids those the verifier finds wrong, then exit "
+                         "(the consumer must be stopped)")
     ap.add_argument("--ack-first", action="store_true",
                     help="NEGATIVE CONTROL: acknowledge each transaction before applying it (loses changes on a crash)")
     args = ap.parse_args()
     mode = args.mode
+    global GUARD
+    GUARD = not args.no_version_guard
     use_marker = not args.no_backfill_marker
     alias_swap = not args.no_alias_swap
     if alias_swap and not use_marker:
         ap.error("--no-backfill-marker needs --no-alias-swap (the marker records which collection the slot feeds)")
     variant = "snapshot" if args.backfill else args.naive_backfill
+    if args.repair is not None:
+        if variant or args.ack_first:
+            ap.error("--repair doesn't combine with a backfill or --ack-first")
+        if serving_collection() is None:
+            ap.error("--repair needs an index to repair; run a backfill first")
+        ensure_versions()
+        sys.exit(repair(args.repair))
     if not variant and use_marker:
         why = recover_alias_state() if alias_swap else (None if backfill_marker_present() else "backfill-completed marker is missing")
         if why:
@@ -554,6 +744,8 @@ def main() -> None:
                         "Running a full backfill instead of streaming.", why, SLOT,
                         "exists" if slot_exists() else "does not exist")
             variant = "snapshot"
+    if not variant:
+        ensure_versions()  # an index built before versions existed gets its (empty) pair now, before the orphan sweep
     if alias_swap:
         sweep_orphans()  # after the marker handling above, so any roll-forward swap has already happened
     if variant:
@@ -565,6 +757,8 @@ def main() -> None:
         # A *replication* connection speaks the streaming replication protocol,
         # which is what lets us START_REPLICATION on a logical slot.
         conn = psycopg2.connect(DSN, connection_factory=psycopg2.extras.LogicalReplicationConnection)
+    if GUARD:
+        sweep_tombstones()
     cur = conn.cursor()
     # decode=True gives str payloads. Starting without start_lsn resumes from the
     # slot's confirmed position, i.e. everything we haven't acknowledged yet.
@@ -573,7 +767,7 @@ def main() -> None:
 
     last_flushed = [0]  # LSN of the last message fully handled
 
-    pending: list[str] = []  # --ack-first only: a transaction's changes, held until its COMMIT arrives
+    pending: list[tuple[int, str]] = []  # --ack-first only: a transaction's changes (LSN, text), held until its COMMIT arrives
 
     def consume_ack_first(msg):
         # NEGATIVE CONTROL. Acking a change message's own LSN would not skip its transaction (Postgres
@@ -586,16 +780,16 @@ def main() -> None:
         elif payload.startswith("COMMIT"):
             msg.cursor.send_feedback(flush_lsn=msg.data_start, force=True)
             last_flushed[0] = msg.data_start
-            for p in pending:
+            for lsn, p in pending:
                 hook("recv")
-                handle(p, mode)
+                handle(p, mode, lsn)
             pending.clear()
         else:
-            pending.append(payload)
+            pending.append((msg.data_start, payload))
 
     def consume(msg):
         hook("recv")
-        handle(msg.payload.strip(), mode)
+        handle(msg.payload.strip(), mode, msg.data_start)
         hook("before_ack")
         # Acknowledge: tells Postgres it may discard WAL up to this LSN.
         # Done after handling, so a crash mid-change means redelivery (at-least-once).

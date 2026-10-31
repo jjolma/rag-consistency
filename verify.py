@@ -32,7 +32,7 @@ import psycopg2
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-from common import COLLECTION, DSN, QDRANT_URL, SLOT, alias_target, chunk_body, chunk_hash, iso_utc
+from common import COLLECTION, DSN, QDRANT_URL, SLOT, VERSIONS, alias_target, chunk_body, chunk_hash, iso_utc
 
 
 Key = tuple[int, int]  # (article_id, chunk_index)
@@ -87,11 +87,11 @@ def read_qdrant() -> tuple[dict[Key, Chunk], bool]:
 
 
 def read_orphan_collections() -> list[str]:
-    """Physical collections with the article_chunks_ prefix that the alias doesn't point at."""
+    """Physical collections with the article_chunks_ or article_versions_ prefix that the matching alias doesn't point at."""
     client = QdrantClient(url=QDRANT_URL)
-    target = alias_target(client)
+    targets = {COLLECTION: alias_target(client), VERSIONS: alias_target(client, VERSIONS)}
     return sorted(c.name for c in client.get_collections().collections
-                  if c.name.startswith(f"{COLLECTION}_") and c.name != target)
+                  for prefix, target in targets.items() if c.name.startswith(f"{prefix}_") and c.name != target)
 
 
 @dataclass

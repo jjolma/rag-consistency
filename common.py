@@ -1,15 +1,22 @@
 """Settings and helpers shared by the consumer and the verifier."""
 import hashlib
+import os
 import uuid
 from datetime import datetime, timezone
 
-DSN = "host=localhost port=5432 dbname=app user=postgres password=postgres"
+# The RAG_* environment variables exist so test_guard.py can run against a throwaway database, slot and
+# collections without touching the real ones; nothing else sets them.
+DSN = os.environ.get("RAG_DSN", "host=localhost port=5432 dbname=app user=postgres password=postgres")
 QDRANT_URL = "http://localhost:6333"
-SLOT = "articles_slot"
+SLOT = os.environ.get("RAG_SLOT", "articles_slot")
 # The name every reader queries, one point per (article_id, chunk_index). In alias mode (the default) it is
 # an alias for a physical collection article_chunks_<stamp>_<id>; with --no-alias-swap it is the physical
 # collection itself. Readers never need to know which.
-COLLECTION = "article_chunks"
+COLLECTION = os.environ.get("RAG_COLLECTION", "article_chunks")
+# One point per article (id = article_id) holding the LSN of the last change applied to it, see the version
+# guard in cdc_consumer.py. It pairs with the physical collection COLLECTION points at: a rebuild fills
+# article_chunks_<x> and article_versions_<x> and repoints both aliases in one request. Only the consumer reads it.
+VERSIONS = os.environ.get("RAG_VERSIONS", "article_versions")
 MODEL_NAME = "all-MiniLM-L6-v2"  # 384-dim
 CHUNK_SIZE = 200  # characters
 
