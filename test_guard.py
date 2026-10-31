@@ -18,6 +18,11 @@ Everything runs against a throwaway database (rag_guard_test), replication slot 
                           behind the consumer's back); replay can't fix it, `--repair` does, and the consumer then
                           streams on without undoing it
 
+  test_background_sweeps  stale tombstones and an orphan collection are removed after streaming starts; a tombstone
+                          at or above the slot's confirmed position is kept
+  test_sweep_failure_is_nonfatal  both sweeps raise (SWEEP_FAULT): each failure is logged, the consumer stays up
+                          and keeps applying changes
+
 test_replay_rewind and test_tombstone read the two consumer runs (guard on, guard off) of one scenario.
 """
 import logging
@@ -484,7 +489,54 @@ def test_repair() -> None:
         consumer.stop()
 
 
-TESTS = [test_guard_semantics, test_paired_swap, test_replay_rewind, test_tombstone, test_repair]
+def test_background_sweeps() -> None:
+    reset_all()
+    start_consumer().stop()  # first start backfills and leaves a streaming-ready index
+    wait_slot_free()
+    confirmed = confirmed_lsn()
+    old_id, new_id = 10**7, 10**7 + 1
+    vec = [1.0]
+    client.upsert(VERSIONS, points=[PointStruct(id=old_id, vector=vec, payload={"lsn": 1, "deleted": True}),
+                                    PointStruct(id=new_id, vector=vec, payload={"lsn": confirmed + 10**9, "deleted": True})])
+    orphan = f"{COLLECTION}_orphan"
+    cdc().create_index_collection(orphan)
+    consumer = start_consumer()
+    try:
+        consumer.wait_for("swept 1 tombstone")
+        assert not client.collection_exists(orphan), "the orphan collection survived the background sweep"
+        assert version_of(old_id) is None, "a tombstone below the slot's confirmed position was kept"
+        assert version_of(new_id) is not None, "a tombstone above the confirmed position was removed"
+        wait_indexed(insert(body(3, "after")))  # and streaming works
+    finally:
+        consumer.stop()
+
+
+def test_sweep_failure_is_nonfatal() -> None:
+    reset_all()
+    start_consumer().stop()
+    wait_slot_free()
+    os.environ["SWEEP_FAULT"] = "1"  # every background sweep raises
+    try:
+        consumer = start_consumer()
+    finally:
+        del os.environ["SWEEP_FAULT"]
+    try:
+        consumer.wait_for("background sweep_orphans failed")
+        consumer.wait_for("background sweep_tombstones failed")  # one failure doesn't stop the next sweep
+        a = insert(body(4, "a"))
+        wait_indexed(a)
+        assert consumer.proc.poll() is None, "the consumer died after a sweep failure"
+        update(a, body(7, "b"))
+        t0 = time.monotonic()
+        while chunk_count(a) != 7:
+            assert time.monotonic() - t0 < 60, "streaming stopped after a sweep failure"
+            time.sleep(0.1)
+    finally:
+        consumer.stop()
+
+
+TESTS = [test_guard_semantics, test_paired_swap, test_replay_rewind, test_tombstone, test_repair,
+         test_background_sweeps, test_sweep_failure_is_nonfatal]
 
 
 def main() -> int:

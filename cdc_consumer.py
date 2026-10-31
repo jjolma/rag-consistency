@@ -34,6 +34,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import uuid
 import zlib
@@ -43,7 +44,7 @@ import psycopg2
 import psycopg2.extras
 from qdrant_client import QdrantClient
 from qdrant_client.models import (CreateAlias, CreateAliasOperation, DeleteAlias, DeleteAliasOperation, Distance,
-                                  FieldCondition, Filter, FilterSelector, MatchValue, PayloadSchemaType, PointStruct,
+                                  FieldCondition, Filter, FilterSelector, HasIdCondition, MatchValue, PayloadSchemaType, PointStruct,
                                   Range, VectorParams)
 from sentence_transformers import SentenceTransformer
 
@@ -65,6 +66,9 @@ UPSERT_BATCH = int(os.environ.get("UPSERT_BATCH", "256"))  # points per Qdrant u
 STAGE_FILE = os.environ.get("STAGE_FILE")
 FAULT = os.environ.get("FAULT")
 FAULT_AT = int(os.environ.get("FAULT_AT", "1"))
+SWEEP_FAULT = bool(os.environ.get("SWEEP_FAULT"))  # test_guard.py: make every background sweep raise
+SWEEP_BUDGET_S = float(os.environ.get("SWEEP_BUDGET_S", "30"))  # wall-clock cap for one background pass
+SWEEP_BATCH = int(os.environ.get("SWEEP_BATCH", "500"))  # tombstones deleted per request
 _stage_fd = os.open(STAGE_FILE, os.O_WRONLY | os.O_CREAT) if STAGE_FILE else None
 _hits: dict[str, int] = {}
 
@@ -228,17 +232,21 @@ def drop_collections_except(keep: str | None) -> None:
             log.info("deleted collection %s", name)
 
 
-def sweep_orphans() -> None:
+def sweep_orphans(deadline: float = float("inf")) -> None:
     """Startup catch-all: delete every article_chunks_* collection except the alias target and the one the
     marker names. The path-specific cleanups (recover_alias_state, backfill's start and end) cover the
     crashes we know about; this covers whatever they miss. It must run after the marker has been handled,
     and keeps the marker's collection even if the alias doesn't point at it: that is the finished build
-    the slot feeds, waiting for a roll-forward swap, and deleting it would lose the only copy."""
+    the slot feeds, waiting for a roll-forward swap, and deleting it would lose the only copy. One collection
+    per step; stops at `deadline` (time.monotonic()) and leaves the rest for the next start."""
     marker = read_backfill_marker()
     keep = {alias_target(qdrant), (marker or {}).get("collection")} - {None}
     keep |= {versions_name(name) for name in keep}
     for name in physical_names():
         if name.startswith((f"{COLLECTION}_", f"{VERSIONS}_")) and name not in keep:
+            if time.monotonic() >= deadline:
+                log.info("orphan sweep: out of time, the rest waits for the next start")
+                return
             log.warning("orphan sweep: deleting %s (not the alias target %s, not named by the marker)",
                         name, alias_target(qdrant))
             qdrant.delete_collection(name)
@@ -368,22 +376,51 @@ def stamp_version(article_id: int, lsn: int, deleted: bool = False) -> None:
     _versions[article_id] = lsn
 
 
-def sweep_tombstones() -> None:
+def sweep_tombstones(deadline: float = float("inf")) -> None:
     """Drop tombstones the slot can no longer replay past. Replay starts at confirmed_flush_lsn and only
     delivers transactions that commit after it; a change older than a tombstone committed before the
-    tombstone's own change, so before confirmed_flush_lsn once the tombstone is below it."""
+    tombstone's own change, so before confirmed_flush_lsn once the tombstone is below it. The position is
+    read once and only grows, so using it for the whole pass stays safe. Runs in batches while the stream
+    is live: each delete re-applies the filter to the batch's ids, so a tombstone that streaming has since
+    replaced by a newer insert is left alone. Stops at `deadline`; the rest waits for the next start."""
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT confirmed_flush_lsn - '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = %s", (SLOT,))
         row = cur.fetchone()
     conn.close()
     if not row or row[0] is None:
         return
-    gone = Filter(must=[FieldCondition(key="deleted", match=MatchValue(value=True)),
-                        FieldCondition(key="lsn", range=Range(lt=int(row[0])))])
-    n = qdrant.count(VERSIONS, count_filter=gone, exact=True).count
-    if n:
-        qdrant.delete(VERSIONS, points_selector=FilterSelector(filter=gone))
-        log.info("swept %d tombstone(s) below the slot's confirmed position", n)
+    below = [FieldCondition(key="deleted", match=MatchValue(value=True)),
+             FieldCondition(key="lsn", range=Range(lt=int(row[0])))]
+    total = 0
+    while time.monotonic() < deadline:
+        batch, _ = qdrant.scroll(VERSIONS, scroll_filter=Filter(must=below), limit=SWEEP_BATCH,
+                                 with_payload=False, with_vectors=False)
+        if not batch:
+            break
+        qdrant.delete(VERSIONS, points_selector=FilterSelector(
+            filter=Filter(must=[HasIdCondition(has_id=[p.id for p in batch]), *below])))
+        total += len(batch)
+    else:
+        log.info("tombstone sweep: out of time, the rest waits for the next start")
+    if total:
+        log.info("swept %d tombstone(s) below the slot's confirmed position", total)
+
+
+def run_sweeps(sweeps, budget: float = SWEEP_BUDGET_S) -> threading.Thread:
+    """Run the startup sweeps one after another on a daemon thread, after streaming has begun. They are
+    housekeeping: an error is logged and the next sweep still runs, nothing here can stop or block the stream."""
+    def work() -> None:
+        deadline = time.monotonic() + budget
+        for sweep in sweeps:
+            try:
+                if SWEEP_FAULT:
+                    raise RuntimeError("injected sweep fault")
+                sweep(deadline)
+            except Exception:  # noqa: BLE001
+                log.exception("background %s failed; streaming is unaffected", sweep.__name__)
+    t = threading.Thread(target=work, name="sweeps", daemon=True)
+    t.start()
+    return t
 
 
 def ensure_versions() -> None:
@@ -746,8 +783,6 @@ def main() -> None:
             variant = "snapshot"
     if not variant:
         ensure_versions()  # an index built before versions existed gets its (empty) pair now, before the orphan sweep
-    if alias_swap:
-        sweep_orphans()  # after the marker handling above, so any roll-forward swap has already happened
     if variant:
         conn = backfill(variant, marker=use_marker, alias_swap=alias_swap)
     else:
@@ -757,13 +792,13 @@ def main() -> None:
         # A *replication* connection speaks the streaming replication protocol,
         # which is what lets us START_REPLICATION on a logical slot.
         conn = psycopg2.connect(DSN, connection_factory=psycopg2.extras.LogicalReplicationConnection)
-    if GUARD:
-        sweep_tombstones()
     cur = conn.cursor()
     # decode=True gives str payloads. Starting without start_lsn resumes from the
     # slot's confirmed position, i.e. everything we haven't acknowledged yet.
     cur.start_replication(slot_name=SLOT, decode=True, options={"include-xids": "0", "skip-empty-xacts": "1"})
     log.info("streaming from slot %s (mode=%s) ...", SLOT, mode)
+    # After the marker handling and any backfill above, so a roll-forward swap has already happened.
+    run_sweeps(([sweep_orphans] if alias_swap else []) + ([sweep_tombstones] if GUARD else []))
 
     last_flushed = [0]  # LSN of the last message fully handled
 
