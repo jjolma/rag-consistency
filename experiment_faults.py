@@ -3,7 +3,7 @@
   python experiment_faults.py calibrate [--rows 800] [--changes 100]
   python experiment_faults.py backfill --recovery plain|rebackfill [--trials 20] [--rows 800] [--no-backfill-marker] [--no-alias-swap]
   python experiment_faults.py control --ack-first [--trials 20] [--window 3]
-  python experiment_faults.py steady --kill random [--trials N | --minutes M] [--window 3] [--mode correct|naive|trim]
+  python experiment_faults.py steady --kill random [--trials N | --minutes M] [--window 3] [--mode trim|correct|naive]
 
 Every trial ends the same way, so results are comparable:
   1. the consumer is SIGKILLed (by an external kill -9 at a random moment, or by itself at a
@@ -27,7 +27,7 @@ get an "-alias" suffix (backfill-plain-alias); --no-alias-swap runs keep the pla
                        random moment during a write burst. Must show persistent loss, or the
                        harness can't see losses.
   steady-random        normal consumer killed at a random moment during a write burst
-                       (--mode naive|trim run the same thing with that UPDATE mode, labelled steady-random-naive etc.)
+                       (--mode trim|correct|naive picks the consumer's UPDATE mode, default trim; labelled steady-random-trim etc.)
 
 Burst kills: a writer thread starts, then the victim is killed after a random 0.05..WINDOW seconds,
 while the consumer is still working through the backlog. `kill_stage` is the last stage boundary
@@ -79,7 +79,7 @@ UPSERTED_RE = re.compile(r"\b(INSERT|UPDATE) id=(\d+) -> (\d+) chunk\(s\) upsert
 DELETED_RE = re.compile(r"\bDELETE id=(\d+) -> deleted all points")
 NO_BACKFILL_MARKER = False  # set by --no-backfill-marker: every consumer started gets the flag
 NO_ALIAS_SWAP = False  # set by --no-alias-swap: likewise
-UPDATE_MODE = "correct"  # set by steady --mode: every consumer started gets --mode <this>
+UPDATE_MODE = "trim"  # set by steady --mode: every consumer started gets --mode <this>
 STARTUP_TIMEOUT_S = 120
 SETTLE_S = 3  # second verification this long after the barrier, to catch late changes
 BACKFILL_BATCH = 200  # articles per fetchmany() in cdc_consumer.backfill()
@@ -96,8 +96,7 @@ def start(*args: str, env: dict[str, str] | None = None):
         args = (*args, "--no-backfill-marker")
     if NO_ALIAS_SWAP:
         args = (*args, "--no-alias-swap")
-    if UPDATE_MODE != "correct":
-        args = (*args, "--mode", UPDATE_MODE)
+    args = (*args, "--mode", UPDATE_MODE)
     return start_consumer(*args, env={"STAGE_FILE": str(STAGE_PATH), **(env or {})})
 
 
@@ -556,7 +555,7 @@ def main() -> None:
     p = sub.add_parser("steady", help="kill the normal consumer at random moments during a write burst")
     common(p, trials=None)
     p.add_argument("--kill", choices=["random"], required=True)
-    p.add_argument("--mode", choices=["correct", "naive", "trim"], default="correct", help="how the consumer treats UPDATEs")
+    p.add_argument("--mode", choices=["trim", "correct", "naive"], default="trim", help="how the consumer treats UPDATEs")
     p.add_argument("--minutes", type=float, help="keep running trials until this much time has passed (alternative to --trials)")
     p.add_argument("--window", type=float, default=3, help="kill at a random 0.05..WINDOW seconds into a write burst")
 
@@ -564,7 +563,7 @@ def main() -> None:
     if args.cmd == "steady" and not (args.trials or args.minutes):
         ap.error("steady needs --trials or --minutes")
     global NO_BACKFILL_MARKER, NO_ALIAS_SWAP, UPDATE_MODE
-    UPDATE_MODE = getattr(args, "mode", "correct")
+    UPDATE_MODE = getattr(args, "mode", "trim")
     NO_BACKFILL_MARKER = args.no_backfill_marker
     NO_ALIAS_SWAP = args.no_alias_swap
     if not NO_ALIAS_SWAP and NO_BACKFILL_MARKER:
@@ -578,7 +577,7 @@ def main() -> None:
     elif args.cmd == "control":
         burst_command(args, label("ack-first"), ("--ack-first",))
     else:
-        burst_command(args, label("steady-random" + ("" if UPDATE_MODE == "correct" else f"-{UPDATE_MODE}")), ())
+        burst_command(args, label(f"steady-random-{UPDATE_MODE}"), ())
 
 
 if __name__ == "__main__":

@@ -16,10 +16,10 @@ known to have completed, so the consumer runs a full backfill instead of streami
 partial index. --no-backfill-marker restores the old behavior (legacy mode only).
 
 Each article body is split into chunks; every chunk is one Qdrant point. On UPDATE:
-  correct (default): delete all points of the article, then insert the new chunks
-  naive:             just upsert the new chunks (leaves orphans if the text got shorter)
-  trim:              upsert the new chunks, then delete the article's points with chunk_index >= the new count
+  trim (default):    upsert the new chunks, then delete the article's points with chunk_index >= the new count
                      (no window with the article missing, but a crash between the two steps leaves the tail)
+  correct:           delete all points of the article, then insert the new chunks
+  naive:             just upsert the new chunks (leaves orphans if the text got shorter)
 DELETE removes all the article's points in both modes.
 """
 import argparse
@@ -526,7 +526,7 @@ def backfill(variant: str = "snapshot", marker: bool = True, alias_swap: bool = 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["naive", "correct", "trim"], default="correct", help="how UPDATE treats existing chunks")
+    ap.add_argument("--mode", choices=["naive", "correct", "trim"], default="trim", help="how UPDATE treats existing chunks")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--backfill", action="store_true", help="index all existing rows first (replaces the slot and the index)")
     group.add_argument("--naive-backfill", nargs="?", const="slot-first", choices=["slot-first", "select-first"],
