@@ -467,6 +467,41 @@ def delete_article_points(article_id: int) -> None:
     hook("after_delete")
 
 
+REWIND_FATAL = bool(os.environ.get("REWIND_FATAL"))  # test mode: raise instead of applying a change older than the article's version
+REWINDS = 0  # changes this process was about to apply with an LSN older than the article's version
+_applied: dict[int, int] = {}  # article_id -> LSN of the last change this process applied (the "prior" when the guard is off)
+
+
+def trace(outcome: str, op: str, article_id: int, lsn: int | None, prior: int | None) -> None:
+    """One machine-readable INFO line per streamed change that was applied or skipped: the change's LSN and the
+    article's prior version (the index's version with the guard on; with it off, the LSN of the last change this
+    process applied, since nothing is stamped; "none" if unknown). experiment_faults.py reads these to check that
+    applied LSNs never go backward per article. The wording avoids "<OP> id=", which the harness counts as an
+    applied-change line."""
+    if lsn is not None:
+        log.info("trace %s article=%s op=%s lsn=%d prior=%s", outcome, article_id, op, lsn,
+                 "none" if prior is None else prior)
+    if outcome == "applied" and lsn is not None:
+        if len(_applied) >= VERSION_CACHE_MAX:
+            _applied.clear()
+        _applied[article_id] = lsn
+
+
+def check_rewind(op: str, article_id: int, lsn: int, prior: int | None) -> None:
+    """Called for a change about to be applied. An LSN strictly below the article's prior version is a rewind: with
+    the guard on it cannot happen (the change was skipped above), so it means the guard is broken; with it off it is
+    the replay damage the guard exists to prevent, seen only for articles this process has already applied (the
+    index keeps no version then). WARN and count it; in test mode (REWIND_FATAL) raise before writing anything."""
+    global REWINDS
+    if prior is not None and lsn < prior:
+        REWINDS += 1
+        msg = (f"REWIND {op} article={article_id}: applying LSN {lsn} older than the article's version {prior} "
+               f"(guard {'on' if GUARD else 'off'}; {REWINDS} so far)")
+        if REWIND_FATAL:
+            raise RuntimeError(msg)
+        log.warning(msg)
+
+
 def handle(payload: str, mode: str, lsn: int | None = None) -> None:
     """Apply one decoded message. `lsn` is the message's own LSN (None: no version guard for this call)."""
     if payload.startswith(("BEGIN", "COMMIT")):
@@ -483,17 +518,24 @@ def handle(payload: str, mode: str, lsn: int | None = None) -> None:
     article_id = int(cols["id"])
 
     guarded = GUARD and lsn is not None
+    version = None
     if guarded:
         version = read_version(article_id)
         if version is not None and lsn < version:
+            trace("skipped", op, article_id, lsn, version)
             log.info("skipped %s of id=%s: LSN %X/%X is older than the index's version %X/%X",
                      op, article_id, lsn >> 32, lsn & 0xFFFFFFFF, version >> 32, version & 0xFFFFFFFF)
             return
+    if lsn is not None:
+        if not guarded:
+            version = _applied.get(article_id)  # no index version without the guard; this process's own history
+        check_rewind(op, article_id, lsn, version)
 
     if op == "DELETE":
         delete_article_points(article_id)
         if guarded:
             stamp_version(article_id, lsn, deleted=True)
+        trace("applied", op, article_id, lsn, version)
         log.info("DELETE id=%s -> deleted all points", article_id)
         return
 
@@ -508,6 +550,7 @@ def handle(payload: str, mode: str, lsn: int | None = None) -> None:
         hook("after_set_payload")
         if guarded:
             stamp_version(article_id, lsn)
+        trace("applied", op, article_id, lsn, version)
         log.info("UPDATE id=%s -> body unchanged, payload refreshed (%s)", article_id, mode)
         return
     chunks = chunk_body(cols.get("body"))
@@ -522,6 +565,7 @@ def handle(payload: str, mode: str, lsn: int | None = None) -> None:
         hook("after_trim")
     if guarded:
         stamp_version(article_id, lsn)
+    trace("applied", op, article_id, lsn, version)
     log.info("%s id=%s -> %d chunk(s) upserted (%s)", op, article_id, len(chunks), mode)
 
 

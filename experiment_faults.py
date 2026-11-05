@@ -23,7 +23,9 @@ Scenarios (the `scenario` column of results/faults.csv). Runs with the consumer'
 get an "-alias" suffix (backfill-plain-alias); --no-alias-swap runs keep the plain names the older rows have.
 Runs with the consumer's version guard (its default) get "-guard" before that (steady-random-trim-guard-alias);
 --no-version-guard runs keep the names the older, unguarded rows have. skipped_after_restart counts the
-replayed changes the guard skipped.
+replayed changes the guard skipped. rewinds counts, per trial, applied changes whose LSN was below the previous applied
+LSN for the same article across victim and recovery (from the consumer's "trace" log lines); with the guard it should be 0. rewind_warnings is the consumer's own
+REWIND warnings over the same span (cdc_consumer.check_rewind; process-local when the guard is off, so it can be lower).
   backfill-plain       kill --backfill mid-copy at a random batch, restart with a plain consumer
   backfill-rebackfill  same kill, but recover by running --backfill again
   ack-first            NEGATIVE CONTROL: victim is `--ack-first` (acks before applying), killed at a
@@ -74,11 +76,13 @@ CAL_PATH = RESULTS / "faults_calibration.json"
 STAGE_PATH = RESULTS / "stage"
 FIELDS = ["timestamp", "scenario", "trial", "seed", "fault", "kill_stage", "kill_after_s", "written",
           "applied_before_kill", "applied_after_restart", "skipped_after_restart", "slot_left", "missing_at_kill",
-          "recovery_s", "inconsistent_s", "absent_s", "max_missing", "max_regressed", "max_pending", "max_orphaned", "max_stale", "max_payload",
+          "recovery_s", "inconsistent_s", "absent_s", "max_missing", "max_regressed", "rewinds", "rewind_warnings", "max_pending", "max_orphaned", "max_stale", "max_payload",
           "final_missing", "final_orphaned", "final_stale", "final_payload", "orphan_collections", "final_lag_bytes",
           "clean", "repaired"]
 APPLIED_RE = re.compile(r"\b(INSERT|UPDATE|DELETE) id=")
 SKIPPED_RE = re.compile(r"\bskipped (INSERT|UPDATE|DELETE) of id=")  # the version guard skipped a replayed change
+REWIND_WARN_RE = re.compile(r"\bWARNING REWIND ")  # the consumer's own detector (cdc_consumer.check_rewind)
+TRACE_RE = re.compile(r"\btrace (applied|skipped) article=(\d+) op=\w+ lsn=(\d+) prior=(\d+|none)")
 UPSERTED_RE = re.compile(r"\b(INSERT|UPDATE) id=(\d+) -> (\d+) chunk\(s\) upserted")
 DELETED_RE = re.compile(r"\bDELETE id=(\d+) -> deleted all points")
 NO_BACKFILL_MARKER = False  # set by --no-backfill-marker: every consumer started gets the flag
@@ -105,7 +109,9 @@ def start(*args: str, env: dict[str, str] | None = None):
     args = (*args, "--mode", UPDATE_MODE)
     if NO_GUARD:
         args = (*args, "--no-version-guard")
-    return start_consumer(*args, env={"STAGE_FILE": str(STAGE_PATH), **(env or {})})
+    proc = start_consumer(*args, env={"STAGE_FILE": str(STAGE_PATH), **(env or {})})
+    proc.backfill = "--backfill" in args  # wait_streaming's timeout follows the consumer, not the call site
+    return proc
 
 
 def label(scenario: str) -> str:
@@ -120,10 +126,16 @@ def read_stage() -> str:
         return "none"
 
 
-def wait_streaming(proc, timeout: float = STARTUP_TIMEOUT_S) -> None:
-    """Wait until the consumer logs that it is streaming. A start with --backfill passes BACKFILL_STARTUP_TIMEOUT_S."""
+def wait_streaming(proc, timeout: float | None = None) -> None:
+    """Wait until the consumer logs that it is streaming, measured from its spawn. The default bound depends on how
+    the consumer was started (start() records it): a --backfill streams only after the whole copy, so it gets
+    BACKFILL_STARTUP_TIMEOUT_S. That holds wherever the process is waited on: a rebuild's consumer is reused as the
+    next trial's victim, long after the call that started it. On failure the consumer is stopped, not left holding the slot."""
+    if timeout is None:
+        timeout = BACKFILL_STARTUP_TIMEOUT_S if proc.backfill else STARTUP_TIMEOUT_S
     while proc.streaming_s is None:
         if proc.poll() is not None or time.monotonic() - proc.spawned > timeout:
+            stop_consumer(proc)
             raise RuntimeError(f"consumer did not start streaming (exit {proc.poll()}); see {CONSUMER_LOG}")
         note_streaming(proc)
         time.sleep(0.1)
@@ -145,6 +157,34 @@ def count_skipped(offset: int) -> int:
     with open(CONSUMER_LOG, "rb") as f:
         f.seek(offset)
         return len(SKIPPED_RE.findall(f.read().decode(errors="replace")))
+
+
+def count_rewinds(offset: int) -> int:
+    """Per-article LSN monotonicity across the victim and recovery consumers, from the consumer's trace lines
+    since `offset`. A rewind is an applied change whose LSN is strictly below the previous applied change's LSN
+    for the same article (an equal LSN, a re-apply of the same change, is allowed). Skipped changes don't count:
+    skipping is the guard doing its job. The log is chronological and the two consumers never overlap."""
+    with open(CONSUMER_LOG, "rb") as f:
+        f.seek(offset)
+        text = f.read().decode(errors="replace")
+    last: dict[int, int] = {}
+    rewinds = 0
+    for outcome, article, lsn, _prior in TRACE_RE.findall(text):
+        if outcome != "applied":
+            continue
+        a, lsn = int(article), int(lsn)
+        if a in last and lsn < last[a]:
+            rewinds += 1
+        last[a] = lsn
+    return rewinds
+
+
+def count_rewind_warnings(offset: int) -> int:
+    """The consumer's own REWIND warnings since `offset`: a second opinion on count_rewinds, but process-local with
+    the guard off (a restarted process doesn't know the victim's LSNs), so it may be lower. With the guard on it must be 0."""
+    with open(CONSUMER_LOG, "rb") as f:
+        f.seek(offset)
+        return len(REWIND_WARN_RE.findall(f.read().decode(errors="replace")))
 
 
 def indexed_at_kill(baseline: set[tuple[int, int]], offset: int) -> set[tuple[int, int]]:
@@ -266,15 +306,16 @@ class Harness:
             proc = start(*args)
         else:
             proc, self.healthy = self.healthy, None
-        wait_streaming(proc, BACKFILL_STARTUP_TIMEOUT_S if "--backfill" in args else STARTUP_TIMEOUT_S)
+        wait_streaming(proc)
         return proc
 
 
 # --- trials ----------------------------------------------------------------
 def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_args: tuple[str, ...], timeout: float,
-                 indexed: set[tuple[int, int]] | None = None) -> None:
+                 indexed: set[tuple[int, int]] | None = None, trace_offset: int | None = None) -> None:
     """Restart, barrier, verify (twice), and fill in the measurement columns of `row`. Leaves the recovery consumer in h.healthy.
-    `indexed` (the chunks in the index at the kill) splits max_missing into max_regressed and max_pending; without it both are blank."""
+    `indexed` (the chunks in the index at the kill) splits max_missing into max_regressed and max_pending; without it both are blank.
+    `trace_offset` (log offset from before the victim started) gives rewinds, the applied-LSN backward steps per article."""
     wait_slot_free()
     marker = insert_marker()
     samples.append((time.monotonic(), verify.check()))  # exposure right after the crash, marker not yet indexed
@@ -296,6 +337,8 @@ def finish_trial(h: Harness, row: dict, t_kill: float, samples: list, recovery_a
     row.update(
         max_regressed=max(len(g) for g, _ in split) if split else "",
         max_pending=max(len(p) for _, p in split) if split else "",
+        rewinds="" if trace_offset is None else count_rewinds(trace_offset),
+        rewind_warnings="" if trace_offset is None else count_rewind_warnings(trace_offset),
         applied_after_restart=count_applied(recovery.log_offset),
         skipped_after_restart=count_skipped(recovery.log_offset),
         recovery_s=round(t_barrier - t_kill, 2),
@@ -333,7 +376,7 @@ def burst_trial(h: Harness, scenario: str, trial: int, seed: int, victim_args: t
     row = {"scenario": scenario, "trial": trial, "seed": seed, "fault": "random", "kill_stage": stage,
            "kill_after_s": round(kill_after, 2), "written": writer.ops,
            "applied_before_kill": count_applied(mark), "slot_left": 1, "missing_at_kill": ""}
-    finish_trial(h, row, t_kill, [], (), timeout=STARTUP_TIMEOUT_S + 120, indexed=indexed_at_kill(baseline, mark))
+    finish_trial(h, row, t_kill, [], (), timeout=STARTUP_TIMEOUT_S + 120, indexed=indexed_at_kill(baseline, mark), trace_offset=mark)
     row["repaired"] = 0
     if not row["clean"]:
         h.rebuild()  # the next trial must start from a known-good index
@@ -353,6 +396,7 @@ def backfill_trial(h: Harness, scenario: str, trial: int, seed: int, recovery: s
     k = random.randint(1, n_batches - 1)  # die after batch k, with at least one batch still to copy
     h.stop_healthy()
     wait_slot_free()
+    mark = log_size()
     victim = start("--backfill", env={"FAULT": "backfill_mid_copy", "FAULT_AT": str(k)})
     try:
         victim.wait(timeout=900)
@@ -366,7 +410,8 @@ def backfill_trial(h: Harness, scenario: str, trial: int, seed: int, recovery: s
            "kill_stage": read_stage(), "kill_after_s": round(t_kill - victim.spawned, 2), "written": 0,
            "applied_before_kill": 0, "slot_left": int(slot_state()[0]), "repaired": 0}
     row["missing_at_kill"] = len(verify.check().missing)
-    finish_trial(h, row, t_kill, [], ("--backfill",) if recovery == "rebackfill" else (), timeout=900)
+    finish_trial(h, row, t_kill, [], ("--backfill",) if recovery == "rebackfill" else (), timeout=900,
+                 trace_offset=mark)
     return row
 
 
@@ -408,6 +453,12 @@ def summarize(scenario: str, rows: list[dict]) -> None:
     print(f"recovery_s (kill -> barrier): median {statistics.median(r['recovery_s'] for r in rows):.1f}   "
           f"inconsistent_s: median {statistics.median(r['inconsistent_s'] for r in rows):.1f}   "
           f"max_missing: median {statistics.median(r['max_missing'] for r in rows)}")
+    rw = [r["rewinds"] for r in rows if r["rewinds"] != ""]
+    if rw:
+        print(f"  rewinds       total {sum(rw)}, median {statistics.median(rw)}, max {max(rw)}, nonzero in {sum(1 for x in rw if x)}/{len(rw)} trials")
+    rww = [r["rewind_warnings"] for r in rows if r["rewind_warnings"] != ""]
+    if rww:
+        print(f"  consumer REWIND warnings: total {sum(rww)}" + ("   <-- with the guard on this must be 0" if sum(rww) and not NO_GUARD else ""))
     for key in ("max_regressed", "max_pending"):
         vals = [r[key] for r in rows if r[key] != ""]
         if vals:
@@ -434,7 +485,7 @@ def run_trials(name: str, trial_fn, trials: int | None, minutes: float | None) -
         rows.append(row)
         print(f"[{name} {i}{'/' + str(trials) if trials else ''}] {durations[-1]:.0f}s  stage={row['kill_stage']}  "
               f"recovery={row['recovery_s']}s inconsistent={row['inconsistent_s']}s  "
-              f"max regressed/pending={row['max_regressed']}/{row['max_pending']}  skipped={row['skipped_after_restart']}  "
+              f"max regressed/pending={row['max_regressed']}/{row['max_pending']}  rewinds={row['rewinds']} (consumer warned {row['rewind_warnings']})  skipped={row['skipped_after_restart']}  "
               f"final m/o/s/p={row['final_missing']}/{row['final_orphaned']}/{row['final_stale']}/{row['final_payload']}  "
               f"orphan_colls={row['orphan_collections']}  "
               f"lag={'slot gone' if row['final_lag_bytes'] == '' else str(row['final_lag_bytes']) + 'B'}  "
@@ -450,7 +501,7 @@ def cmd_calibrate(args) -> None:
     t0 = proc.spawned
     try:
         t_done = await_barrier(proc, insert_marker(), 900)
-        wait_streaming(proc, BACKFILL_STARTUP_TIMEOUT_S)  # the marker is indexed by the copy, before streaming starts
+        wait_streaming(proc)  # the marker is indexed by the copy, before streaming starts
     except BaseException:
         stop_consumer(proc)
         raise

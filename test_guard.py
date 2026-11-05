@@ -9,6 +9,7 @@ Everything runs against a throwaway database (rag_guard_test), replication slot 
   test_guard_semantics    in-process, one handle() call per replayed change: strictly older is skipped, equal is
                           applied again, the version is stamped last, deletes leave a tombstone, an absent version
                           means apply, payload-only refreshes are guarded; the same calls with the guard off rewind
+  test_rewind_detector    check_rewind counts and WARNs an older-than-version change (REWIND_FATAL: raises first)
   test_paired_swap        the chunks and versions aliases move together (polled while swapping), and a drop keeps pairs
   test_replay_rewind      consumer kill -9'd after applying "shrink to 5 chunks" then "grow to 30" with the acks still
                           unsent; on restart the article must never drop below 30 chunks (the same run without the
@@ -328,6 +329,40 @@ def test_guard_semantics() -> None:
         c.GUARD = True
 
 
+def test_rewind_detector() -> None:
+    """check_rewind: a change older than the article's version is counted and WARNed (guard off: against the
+    process's own last applied LSN); with REWIND_FATAL it raises before writing anything. The guard on never trips it."""
+    c = cdc()
+    fresh_index()
+    h = lambda a, text, lsn: c.handle(msg("UPDATE", a, text, "2026-01-01 00:00:00+00"), "trim", lsn)  # noqa: E731
+    a = 1101
+    c.GUARD, c.REWIND_FATAL = False, False
+    c._applied.clear()
+    c.REWINDS = 0
+    try:
+        h(a, body(22, "v1"), 100)
+        h(a, body(22, "v1"), 100)
+        assert c.REWINDS == 0, "an equal re-apply is not a rewind"
+        h(a, body(5, "v0"), 90)
+        assert c.REWINDS == 1 and len(chunk_points(a)) == 5, "guard off: the older change should apply and count as a rewind"
+        c.REWIND_FATAL = True
+        try:
+            h(a, body(9, "v0"), 80)
+            raise AssertionError("REWIND_FATAL did not raise")
+        except RuntimeError as e:
+            assert "REWIND" in str(e)
+        assert len(chunk_points(a)) == 5, "a fatal rewind must not write anything"
+        c.GUARD = True
+        c._versions.clear()
+        c.REWINDS = 0
+        b = 1102
+        h(b, body(22, "v1"), 100)
+        h(b, body(5, "v0"), 90)  # skipped by the guard, so never a rewind, even in fatal mode
+        assert c.REWINDS == 0 and len(chunk_points(b)) == 22
+    finally:
+        c.GUARD, c.REWIND_FATAL = True, False
+
+
 def test_paired_swap() -> None:
     c = cdc()
     reset_qdrant()
@@ -535,7 +570,7 @@ def test_sweep_failure_is_nonfatal() -> None:
         consumer.stop()
 
 
-TESTS = [test_guard_semantics, test_paired_swap, test_replay_rewind, test_tombstone, test_repair,
+TESTS = [test_guard_semantics, test_rewind_detector, test_paired_swap, test_replay_rewind, test_tombstone, test_repair,
          test_background_sweeps, test_sweep_failure_is_nonfatal]
 
 
