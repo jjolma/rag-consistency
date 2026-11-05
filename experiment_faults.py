@@ -86,6 +86,7 @@ NO_ALIAS_SWAP = False  # set by --no-alias-swap: likewise
 NO_GUARD = False  # set by --no-version-guard: likewise (the consumer's version guard is on by default)
 UPDATE_MODE = "trim"  # set by steady --mode: every consumer started gets --mode <this>
 STARTUP_TIMEOUT_S = 120
+BACKFILL_STARTUP_TIMEOUT_S = 900  # a --backfill streams only after the whole copy; same bound as the other backfill waits
 SETTLE_S = 3  # second verification this long after the barrier, to catch late changes
 BACKFILL_BATCH = 200  # articles per fetchmany() in cdc_consumer.backfill()
 
@@ -119,9 +120,10 @@ def read_stage() -> str:
         return "none"
 
 
-def wait_streaming(proc) -> None:
+def wait_streaming(proc, timeout: float = STARTUP_TIMEOUT_S) -> None:
+    """Wait until the consumer logs that it is streaming. A start with --backfill passes BACKFILL_STARTUP_TIMEOUT_S."""
     while proc.streaming_s is None:
-        if proc.poll() is not None or time.monotonic() - proc.spawned > STARTUP_TIMEOUT_S:
+        if proc.poll() is not None or time.monotonic() - proc.spawned > timeout:
             raise RuntimeError(f"consumer did not start streaming (exit {proc.poll()}); see {CONSUMER_LOG}")
         note_streaming(proc)
         time.sleep(0.1)
@@ -264,7 +266,7 @@ class Harness:
             proc = start(*args)
         else:
             proc, self.healthy = self.healthy, None
-        wait_streaming(proc)
+        wait_streaming(proc, BACKFILL_STARTUP_TIMEOUT_S if "--backfill" in args else STARTUP_TIMEOUT_S)
         return proc
 
 
@@ -448,7 +450,7 @@ def cmd_calibrate(args) -> None:
     t0 = proc.spawned
     try:
         t_done = await_barrier(proc, insert_marker(), 900)
-        wait_streaming(proc)  # the marker is indexed by the copy, before streaming starts
+        wait_streaming(proc, BACKFILL_STARTUP_TIMEOUT_S)  # the marker is indexed by the copy, before streaming starts
     except BaseException:
         stop_consumer(proc)
         raise
