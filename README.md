@@ -7,9 +7,11 @@ and how it recovers when the consumer is killed, restarted or backfilled.
 *This README was drafted by Claude Code, except the Findings section, which I wrote myself.*
 
 ```
-Postgres articles ──WAL (logical slot)──> cdc_consumer.py ──chunk + embed──> Qdrant
-        │                                                                      │
-        └───────────────────────── verify.py compares both ────────────────────┘
++-------------------+        +-----------------+          +--------+
+| Postgres articles | -WAL-> | cdc_consumer.py | -embed-> | Qdrant |
++-------------------+        +-----------------+          +--------+
+          ^                                                    ^
+          +------------- verify.py compares both --------------+
 ```
 
 ## Prerequisites
