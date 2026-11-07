@@ -14,6 +14,25 @@ and how it recovers when the consumer is killed, restarted or backfilled.
           +------------- verify.py compares both --------------+
 ```
 
+## Findings
+
+<!-- To be written. -->
+
+## Pipeline design
+
+The consumer is a plain CDC loop; the safeguards around it are what the experiments pushed it toward. Each
+line names the failure it answers (see `docs/fault_design.md` for the crash points behind them).
+
+| Safeguard | What it does | Failure it answers |
+|---|---|---|
+| Chunking, insert-then-trim | Bodies are split into 200-character chunks (`common.chunk_body`) with deterministic point ids. An UPDATE upserts the new chunks, then deletes the article's chunks beyond the new count (`trim`, the default). | Delete-then-insert (`correct` mode) leaves the article with no points between the two steps; plain upsert (`naive`) leaves orphan chunks when the text gets shorter. A crash between trim's two steps leaves a stale tail instead. |
+| Backfill completion marker | A marker in Qdrant records that a copy finished and which collection the slot feeds. Without it a plain start runs a full backfill instead of streaming. | `kill -9` mid-backfill leaves the slot behind; a plain restart would stream onto the half-built index and never fill the gap. |
+| Alias-swap rebuilds | Readers query the alias `article_chunks`. A backfill builds a new physical collection and repoints the alias when done. | A rebuild that deletes and recreates the collection readers query leaves them with an empty or missing index meanwhile. |
+| Version guard with tombstones | Each change's LSN is the article's version, kept in a paired versions collection that swaps with the chunks. A replayed change with a lower LSN is skipped. Deletes leave tombstones. | Acks are batched, so a crash replays up to about 10 s of already-applied changes, which can rewind an article through its history or resurrect a deleted one. |
+| `--repair` | Rebuilds the articles the verifier finds wrong (or the ids you give) from Postgres, ignoring the guard. | The guard means replay no longer fixes a bad write that was already stamped with a version. |
+| Single-instance lock | A Postgres advisory lock on a dedicated connection; a second consumer exits. | The marker handling, sweeps and slot all assume one consumer. The lock is released when the process dies, even on `kill -9`. |
+| Background sweeps | After streaming starts, one sweep deletes orphan `article_chunks_*` collections and another drops tombstones the slot can no longer replay past. Errors are logged and never stop the stream. | Crashes mid-rebuild leave superseded collections, and tombstones would otherwise accumulate. |
+
 ## Prerequisites
 
 - Docker Desktop, running
@@ -176,9 +195,41 @@ on your machine). `--seed` makes the kill points repeatable.
 Results are appended to `results/*.csv` (for these experiments, `results/faults.csv`). Each script's module
 docstring documents its options, and `docs/fault_design.md` explains the fault experiments.
 
-## Findings
+## Repo map
 
-<!-- To be written. -->
+| File | What it is |
+|---|---|
+| `cdc_consumer.py` | The CDC consumer: reads a logical replication slot (`test_decoding`), chunks and embeds articles, writes them to Qdrant, and implements the safeguards above. |
+| `common.py` | Shared settings and helpers: chunking, point ids, timestamp normalisation, connection settings. |
+| `verify.py` | The oracle: compares Postgres with Qdrant and reports missing, orphaned, stale and payload-stale chunks plus orphan collections. |
+| `mutate.py` | Insert, update or delete a test article by hand. |
+| `dump_qdrant.py` | Print every point in the index. |
+| `experiment_faults.py` | The `kill -9` harness: `calibrate`, `backfill`, `control` and `steady` experiments. |
+| `experiment_outage.py` | Earlier experiment: stop the consumer, write N changes, restart and time the catch-up. |
+| `experiment_backfill.py` | Earlier experiment: backfill under concurrent writes, with two negative controls. |
+| `experiment_chunks.py` | Earlier experiment: orphaned chunks when text gets shorter, in `naive` and `correct` modes. |
+| `test_guard.py` | Tests for the version guard, paired swap, tombstones, `--repair` and sweeps, against a throwaway database. |
+| `docs/fault_design.md` | The fault-injection design and ranked predictions. |
+| `init.sql`, `docker-compose.yml`, `requirements.txt` | The `articles` table, the Postgres 16 and Qdrant containers, and Python dependencies. |
+| `CLAUDE.md` | Guidance for Claude Code when working in this repo. |
+
+Experiment output goes to `results/`, which is created on first use and is not committed.
+
+## Limitations
+
+- **Research code, not production:** built to measure failure and recovery, not to run a real service.
+  There is no authentication (the compose file uses the default `postgres` password), no metrics and no
+  packaging.
+- **One machine, small corpus:** everything runs against Docker containers on localhost. The experiments
+  use hundreds of articles (`--rows` defaults to 800), and `verify.py` re-chunks every row, so it won't
+  scale to a large table.
+- **`test_decoding`, not `pgoutput`:** the consumer parses the plugin's human-readable text. That keeps the
+  stream easy to inspect but is not what a production setup would use.
+- **Only the consumer is killed:** the experiments `kill -9` the consumer. They do not crash Postgres or
+  Qdrant, partition the network, or drop a single request (the design doc leaves a TCP-proxy approach for
+  later).
+- **Naive chunking:** fixed 200-character chunks, deliberately simple so chunk boundaries are predictable.
+- **One consumer at a time:** by design, enforced by the advisory lock.
 
 ## Troubleshooting
 
@@ -190,3 +241,7 @@ docstring documents its options, and `docs/fault_design.md` explains the fault e
   running against this slot. Only one can run at a time, and the experiments refuse to start while one
   does. Stop it (Ctrl-C in its terminal) and try again.
 - **A warning about unauthenticated requests to the Hugging Face Hub:** harmless; no token is needed.
+
+## License
+
+[MIT](LICENSE).
