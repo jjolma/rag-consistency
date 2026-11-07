@@ -4,6 +4,8 @@ A change-data-capture pipeline that keeps a Qdrant RAG index in sync with Postgr
 through logical replication, plus fault-injection experiments that measure how the index goes wrong
 and how it recovers when the consumer is killed, restarted or backfilled.
 
+*This README was drafted by Claude Code, except the Findings section, which I wrote myself.*
+
 ```
 Postgres articles ──WAL (logical slot)──> cdc_consumer.py ──chunk + embed──> Qdrant
         │                                                                      │
@@ -170,6 +172,10 @@ on your machine). `--seed` makes the kill points repeatable.
 
 Results are appended to `results/*.csv` (for these experiments, `results/faults.csv`). Each script's module
 docstring documents its options, and `docs/fault_design.md` explains the fault experiments.
+
+## Findings
+
+<!-- To be written. -->
 
 ## Troubleshooting
 
