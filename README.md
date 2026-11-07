@@ -20,7 +20,7 @@ and how it recovers when the consumer is killed, restarted or backfilled.
 - Python 3.11
 - macOS or Linux (tested on an M-series MacBook Air)
 - Ports 5432 (Postgres) and 6333 (Qdrant) free
-- Internet access on first run: `pip install` pulls PyTorch (a few GB), and the first consumer start downloads the embedding model (about 90 MB)
+- Internet access on first run: `pip install` downloads about 220 MB on an Apple-silicon Mac (PyTorch is 132 MB of that) and takes about 1.1 GB of disk once installed, and the first consumer start downloads the embedding model (about 90 MB). On Linux, pip's default PyTorch wheel bundles CUDA libraries and can be several GB; a CPU-only build is much smaller (not measured here).
 
 ## Quickstart
 
