@@ -97,12 +97,12 @@ The consumer is the only thing keeping the index in sync, so stop it and the ind
 
 1. In Terminal 1, press Ctrl-C to stop the consumer.
 2. In Terminal 2, add an article: `python mutate.py insert "Written while down" "Nobody is indexing this."`
-3. Run `python verify.py`. The new article is reported as missing from Qdrant (`5` below is its id; yours
-   will differ):
+3. Run `python verify.py`. After steps 3-5 above you have one article, so there are now two rows in
+   Postgres and one point in Qdrant, and the new article (id 3) is reported as missing:
 
    ```
-   source rows: 4   index points: 3
-   missing     1  [(5, 0)]
+   source rows: 2   index points: 1
+   missing     1  [(3, 0)]
    orphaned    0  []
    stale       0  []
    payload     0  []
@@ -115,9 +115,10 @@ The consumer is the only thing keeping the index in sync, so stop it and the ind
    the consumer.
 4. In Terminal 1, start the consumer again: `python cdc_consumer.py`. It replays the change from the
    replication slot, which kept the WAL while the consumer was away.
-5. Wait until the consumer's log shows `streaming from slot` and the replayed change (loading the model
-   makes the restart take longer than the replay itself, about 25 seconds in testing), then run
-   `python verify.py` again. It prints `CONSISTENT` and the lag returns to 0.
+5. Wait until the consumer's log shows `streaming from slot` and the replayed `INSERT id=3` (about 7
+   seconds in testing, mostly loading the model), then run `python verify.py` again. It prints
+   `CONSISTENT` straight away. `lag` may still show a few hundred bytes: the consumer acknowledges
+   changes in batches about every 10 seconds, and the lag drops to 0 after the next ack.
 
 The experiments below do this at scale, with `kill -9` at random moments, and measure what goes wrong.
 
