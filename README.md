@@ -16,7 +16,23 @@ and how it recovers when the consumer is killed, restarted or backfilled.
 
 ## Findings
 
-<!-- To be written. -->
+This project found 19 pipeline issues, of which at least four silently lost or corrupted data. It also found 14 harness bugs. These were discovered through experiments (including \~380 crash trials) and design review. Most issues led to a safeguard, and the key safeguards have a test or experiment to verify that the fix works and the absence of the safeguard would cause the expected problem.
+
+Below are three of the most significant findings.
+
+### Replication lag alone does not measure correctness.
+
+A flawed backfill approach (copy-first ordering) shows no lag even though data was lost. A test run showed 10,497 chunks lost even with 0 bytes of lag. Meanwhile, a healthy pipeline under load shows hundreds of KB. So a healthy pipeline may show more lag than an unhealthy one.
+
+Also, a crashed backfill shows that there is a replication lag but not that data is lost. Test runs showed thousands of chunks lost, while the 3–15 KB of lag only indicated how much catch up was required.
+
+### Backfill crashes could result in permanent, silent data loss. 
+
+Experiment runs lost a median of \~6,200 chunks in 20 out of 20 trials even though no errors were logged. This was discovered during an early pipeline iteration that relied on a Postgres CDC replication slot’s existence to indicate backfill completion. The fix was to write a backfill completion marker. Experiments confirmed this prevented the data loss in 20 out of 20 runs.
+
+### Replaying replication rewinds the index.
+
+If the pipeline crashed and was restarted, unacknowledged changes were sent again (since these ACKs were batched). This resulted in articles reverting to older versions and deleted articles getting resurrected. The fix was to add a marker so replays couldn’t bring back a deleted article and keep track of each article’s version (the guard), ignoring older updates. Experiments verified the older version problem in 5 out of 17 runs and zero rewinds in 17 runs with the guard. A test verified the resurrection fix.
 
 ## Pipeline design
 
