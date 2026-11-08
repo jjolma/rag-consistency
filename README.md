@@ -16,15 +16,15 @@ and how it recovers when the consumer is killed, restarted or backfilled.
 
 ## Findings
 
-This project found 19 pipeline issues, of which at least four silently lost or corrupted data. It also found 14 harness bugs. These were discovered through experiments (including \~380 crash trials) and design review. Most issues led to a safeguard, and the key safeguards have a test or experiment to verify that the fix works and the absence of the safeguard would cause the expected problem.
+This project found 19 pipeline issues, of which at least four silently lost or corrupted data. These were discovered through experiments (including \~380 crash trials) and design review. Most issues led to a safeguard, and the key safeguards have a test or experiment to verify that the fix works and the absence of the safeguard would cause the expected problem.
 
 Below are three of the most significant findings.
 
 ### Replication lag alone does not measure correctness.
 
-A flawed backfill approach (copy-first ordering) shows no lag even though data was lost. A test run showed 10,497 chunks lost even with 0 bytes of lag. Meanwhile, a healthy pipeline under load shows hundreds of KB. So a healthy pipeline may show more lag than an unhealthy one.
+A naive backfill approach (copying the rows, then streaming changes) shows no lag even though data was lost (~10k chunks in an experiment). By contrast, a healthy pipeline under load shows hundreds of KB of lag.
 
-Also, a crashed backfill shows that there is a replication lag but not that data is lost. Test runs showed thousands of chunks lost, while the 3–15 KB of lag only indicated how much catch up was required.
+Also, if the backfill crashes mid-copy and the pipeline is restarted, the lag looks healthy (small, moving) but data is missing.
 
 ### Backfill crashes could result in permanent, silent data loss. 
 
