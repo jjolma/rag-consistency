@@ -28,7 +28,7 @@ Also, if the backfill crashes mid-copy and the pipeline is restarted, the lag lo
 
 ### Backfill crashes could result in permanent, silent data loss. 
 
-Experiment runs lost a median of \~6,200 chunks in 20 out of 20 trials even though no errors were logged. This was discovered during an early pipeline iteration that relied on a Postgres CDC replication slot’s existence to indicate backfill completion. The fix was to write a backfill completion marker. Experiments confirmed this prevented the data loss in 20 out of 20 runs.
+Early pipeline code relied on a Postgres CDC replication slot’s existence to indicate backfill completion. An experiment deliberately killed the backfill partway through the copy then restarted the pipeline normally, 20 times. All 20 trials lost data, with a  median of ~6,200 chunks and no errors logged. This happened because the pipeline saw a replication slot and assumed that meant the backfill completed successfully. So it skipped straight to streaming, and the rows that were never copied were permanently missing from the index. The fix was to write an explicit backfill completion marker, and have the pipeline do a rebuild on startup if the marker is absent. Experiments confirmed the marker worked, with 0 of the 20 trials losing data.
 
 ### Replaying replication rewinds the index.
 
