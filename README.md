@@ -32,7 +32,7 @@ Early pipeline code relied on a Postgres CDC replication slot’s existence to i
 
 ### Replaying replication rewinds the index.
 
-If the pipeline crashed and was restarted, unacknowledged changes were sent again (since these ACKs were batched). This resulted in articles reverting to older versions and deleted articles getting resurrected. The fix was to add a marker so replays couldn’t bring back a deleted article and keep track of each article’s version (the guard), ignoring older updates. Experiments verified the older version problem in 5 out of 17 runs and zero rewinds in 17 runs with the guard. A test verified the resurrection fix.
+The pipeline acknowledges changes in batches (about every 10 seconds). If the pipeline crashed and was restarted, unacknowledged changes were sent again. This resulted in articles reverting to older versions and deleted articles getting resurrected. The fix was two parts: 1) add a record to keep track of each article’s version (the guard) and ignore older updates; 2) add a tombstone for deleted articles, so replays can't undelete them. Experiments verified the older version problem in 5 out of 17 runs and zero rewinds in 17 runs with the guard. A test verified the resurrection fix.
 
 ## Pipeline design
 
