@@ -4,7 +4,7 @@ A change-data-capture pipeline that keeps a Qdrant RAG index in sync with Postgr
 through logical replication, plus fault-injection experiments that measure how the index goes wrong
 and how it recovers when the consumer is killed, restarted or backfilled.
 
-*Everything in this README was written by Claude Code, except the Findings section, which I will write myself.*
+*Everything in this README was written by Claude Code, except the Findings section, which I wrote myself.*
 
 ```
 +-------------------+        +-----------------+          +--------+
