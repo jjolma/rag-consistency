@@ -16,7 +16,7 @@ and how it recovers when the consumer is killed, restarted or backfilled.
 
 ## Findings
 
-This project found 19 pipeline issues, of which at least four silently lost or corrupted data. These were discovered through experiments (including \~380 crash trials) and design review. Most issues led to a safeguard, and the key safeguards have a test or experiment to verify that the fix works and the absence of the safeguard would cause the expected problem.
+This project found [19 pipeline issues](docs/issues.md), of which five silently lost or corrupted data. An issue counts if it was a defect or gap in the pipeline itself, whether it shipped or was caught in review; deliberate baselines, negative controls and harness bugs are not counted. A failure is silent if it lost data permanently or served wrong content without an error; temporary absence is excluded. These were discovered through experiments (including \~380 crash trials) and design review. Most issues led to a safeguard, and the key safeguards have a test or experiment to verify that the fix works and the absence of the safeguard would cause the expected problem.
 
 Below are three of the most significant findings.
 
